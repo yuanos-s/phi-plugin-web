@@ -59,9 +59,10 @@ async def api_check(session_id: str):
             profile_resp = await get_profile(token, sess["is_global"])
             profile = profile_resp.get("data", profile_resp)
             lc_resp = await get_session_token(profile, token, sess["is_global"])
-            st = lc_resp.get("sessionToken", "")
+            st = lc_resp.get("sessionToken")
             if not st:
-                raise HTTPException(500, f"获取 sessionToken 失败: {lc_resp}")
+                error_msg = lc_resp.get("error") or lc_resp.get("message") or "未知错误"
+                raise HTTPException(500, f"获取 sessionToken 失败: {error_msg}")
             del _login_sessions[session_id]
             return {"status": "success", "session_token": st,
                     "is_global": sess["is_global"],
