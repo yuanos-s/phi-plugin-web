@@ -1,8 +1,14 @@
 """
 Phi-Plugin Web — FastAPI 后端
 基于 Catrong/phi-plugin 移植
+
+修复：
+1. /api/login/check 500 错误：所有异常捕获并返回明确信息
+2. session 不在错误时删除（只在成功/过期时删除）
+3. 详细错误信息返回前端
 """
 import uuid
+import logging
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
@@ -16,9 +22,13 @@ from songs import (load_all, get_all_songs, get_song, get_difficulty, get_song_n
                    suggest_acc, LEVELS)
 from history import save_snapshot, get_history, get_rks_trend
 
+logger = logging.getLogger("phi-web")
+logging.basicConfig(level=logging.INFO)
+
 app = FastAPI(title="Phi-Plugin Web")
 
 _login_sessions: dict = {}
+
 
 # ===== 页面 =====
 @app.get("/")
@@ -31,7 +41,10 @@ async def index():
 async def api_qrcode(is_global: bool = False):
     try:
         resp = await request_qrcode(is_global)
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(502, f"TapTap API 错误: {e.response.status_code} {e.response.text[:200]}")
     except Exception as e:
+        logger.exception("request_qrcode failed")
         raise HTTPException(500, f"获取二维码失败: {e}")
     data = resp.get("data", resp)
     sid = str(uuid.uuid4())
@@ -39,6 +52,7 @@ async def api_qrcode(is_global: bool = False):
         "device_code": data.get("device_code", resp.get("device_code", "")),
         "device_id": resp.get("device_id", ""),
         "is_global": is_global,
+        "created_at": __import__("time").time(),
     }
     return {"session_id": sid, "qr_url": data.get("qrcode_url", ""),
             "expires_in": data.get("expires_in", 300)}
@@ -48,39 +62,82 @@ async def api_qrcode(is_global: bool = False):
 async def api_check(session_id: str):
     sess = _login_sessions.get(session_id)
     if not sess:
-        raise HTTPException(404, "登录会话不存在或已过期")
+        raise HTTPException(404, "登录会话不存在或已过期，请重新获取二维码")
+
+    # Step 1: 轮询 TapTap 登录状态
     try:
         result = await poll_login(sess["device_code"], sess["device_id"], sess["is_global"])
+    except httpx.HTTPStatusError as e:
+        # TapTap 返回了 HTTP 错误（非 200）
+        return {"status": "error",
+                "message": f"TapTap 返回 HTTP {e.response.status_code}"}
+    except httpx.RequestError as e:
+        # 网络超时等，不删 session，让前端继续重试
+        return {"status": "waiting", "message": "网络超时，正在重试..."}
     except Exception as e:
-        raise HTTPException(500, f"轮询失败: {e}")
-    if result["status"] == "success":
-        token = result["token"]
-        try:
-            profile_resp = await get_profile(token, sess["is_global"])
-            profile = profile_resp.get("data", profile_resp)
-            lc_resp = await get_session_token(profile, token, sess["is_global"])
-            st = lc_resp.get("sessionToken")
-            if not st:
-                error_msg = lc_resp.get("error") or lc_resp.get("message") or "未知错误"
-                raise HTTPException(500, f"获取 sessionToken 失败: {error_msg}")
-            del _login_sessions[session_id]
-            return {"status": "success", "session_token": st,
-                    "is_global": sess["is_global"],
-                    "player_name": profile.get("name", "")}
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(500, f"登录失败: {e}")
-    elif result["status"] == "waiting":
+        logger.exception("poll_login unexpected error")
+        return {"status": "error", "message": f"轮询异常: {e}"}
+
+    # Step 2: 根据状态处理
+    if result["status"] == "waiting":
         return {"status": "waiting"}
-    elif result["status"] == "scanned":
+    if result["status"] == "scanned":
         return {"status": "scanned"}
-    elif result["status"] == "expired":          # ← 新增处理过期状态
+    if result["status"] == "expired":
         del _login_sessions[session_id]
         return {"status": "expired", "message": "二维码已过期，请重新获取"}
-    else:
+    if result["status"] == "error":
+        # 不删 session，给用户重试机会
+        return {"status": "error", "message": result.get("message", "未知错误")}
+
+    # Step 3: 登录成功，获取 profile + sessionToken
+    # 关键修复：错误时 NOT 删除 session，返回明确错误让前端可以重试
+    if result["status"] == "success":
+        token = result["token"]
+        errors = []
+
+        # 3a: 获取 TapTap profile
+        profile = None
+        try:
+            profile = await get_profile(token, sess["is_global"])
+        except httpx.RequestError as e:
+            return {"status": "error",
+                    "message": f"获取 TapTap 用户信息失败（网络错误）: {e}"}
+        except Exception as e:
+            logger.exception("get_profile failed")
+            return {"status": "error",
+                    "message": f"获取 TapTap 用户信息失败: {e}"}
+
+        # 3b: 用 profile + token 登录 LeanCloud 获取 sessionToken
+        try:
+            lc_resp = await get_session_token(profile, token, sess["is_global"])
+        except RuntimeError as e:
+            return {"status": "error",
+                    "message": f"LeanCloud 登录失败: {e}"}
+        except httpx.RequestError as e:
+            return {"status": "error",
+                    "message": f"LeanCloud 网络错误: {e}"}
+        except Exception as e:
+            logger.exception("get_session_token failed")
+            return {"status": "error",
+                    "message": f"获取 sessionToken 异常: {e}"}
+
+        # 3c: 成功！
+        st = lc_resp.get("sessionToken", "")
+        if not st:
+            return {"status": "error",
+                    "message": f"LeanCloud 未返回 sessionToken: {lc_resp}"}
+
         del _login_sessions[session_id]
-        return {"status": "error", "message": result.get("message", "")}
+        profile_data = profile.get("data", profile) if isinstance(profile, dict) else {}
+        return {
+            "status": "success",
+            "session_token": st,
+            "is_global": sess["is_global"],
+            "player_name": profile_data.get("name", ""),
+        }
+
+    return {"status": "waiting"}
 
 
 # ===== 曲目数据 =====

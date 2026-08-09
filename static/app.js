@@ -1,11 +1,30 @@
-// Phi-Plugin Web — 前端逻辑
+// Phi-Plugin Web — 前端逻辑 (增强版)
 let selectedGlobal = false;
 let loginSessionId = null;
 let pollTimer = null;
+let countdownTimer = null;
 let sessionToken = null;
 let isGlobal = false;
-let allSongsCache = null;
 let currentTab = 'b30';
+
+// ===== 主题切换 =====
+function toggleTheme() {
+  const cur = document.documentElement.getAttribute('data-theme');
+  const next = cur === 'light' ? '' : 'light';
+  if (next) document.documentElement.setAttribute('data-theme', next);
+  else document.documentElement.removeAttribute('data-theme');
+  localStorage.setItem('theme', next || 'dark');
+  $('.theme-toggle').textContent = next === 'light' ? '☀️' : '🌙';
+}
+(function loadTheme() {
+  const saved = localStorage.getItem('theme') || 'dark';
+  if (saved === 'light') {
+    document.documentElement.setAttribute('data-theme', 'light');
+    document.addEventListener('DOMContentLoaded', () => {
+      const t = $('.theme-toggle'); if (t) t.textContent = '☀️';
+    });
+  }
+})();
 
 // ===== Login =====
 function selectServer(g) {
@@ -16,23 +35,53 @@ function selectServer(g) {
 
 async function startLogin() {
   $('#login-status').textContent = '正在获取二维码...';
+  $('#login-status').classList.remove('error');
   $('#login-btn').disabled = true;
   try {
     const r = await fetch('/api/login/qrcode?is_global=' + selectedGlobal, {method:'POST'});
     const d = await r.json();
+    if (!r.ok) { throw new Error(d.detail || '请求失败'); }
     loginSessionId = d.session_id;
-    $('#qr-img-el').src = 'https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=' + encodeURIComponent(d.qr_url);
+
+    $('#qr-img-el').src = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(d.qr_url);
     $('#qr-img').style.display = 'block';
     $('#qr-ph').style.display = 'none';
     $('#login-status').textContent = '请使用 TapTap App 扫描二维码';
     $('#login-btn').textContent = '重新获取';
     $('#login-btn').disabled = false;
+
+    // 倒计时
+    startCountdown(d.expires_in || 300);
+
     if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(pollLogin, 3000);  // 改为 3 秒避免限流
+    pollTimer = setInterval(pollLogin, 2500);
   } catch(e) {
-    $('#login-status').textContent = '获取失败: ' + e;
+    $('#login-status').textContent = '获取失败: ' + e.message;
+    $('#login-status').classList.add('error');
     $('#login-btn').disabled = false;
   }
+}
+
+function startCountdown(seconds) {
+  let remain = seconds;
+  if (countdownTimer) clearInterval(countdownTimer);
+  const update = () => {
+    if (remain <= 0) {
+      clearInterval(countdownTimer); countdownTimer = null;
+      $('#qr-countdown').textContent = '二维码已过期';
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      $('#login-btn').disabled = false;
+      $('#qr-img').style.display = 'none';
+      $('#qr-ph').style.display = 'flex';
+      return;
+    }
+    const m = Math.floor(remain / 60);
+    const s = remain % 60;
+    $('#qr-countdown').textContent = `⏱ ${m}:${s.toString().padStart(2,'0')}`;
+    remain--;
+  };
+  update();
+  countdownTimer = setInterval(update, 1000);
 }
 
 async function pollLogin() {
@@ -40,43 +89,57 @@ async function pollLogin() {
   try {
     const r = await fetch('/api/login/check?session_id=' + loginSessionId);
     const d = await r.json();
+
     if (d.status === 'waiting') {
       $('#login-status').textContent = '等待扫码...';
     } else if (d.status === 'scanned') {
-      $('#login-status').textContent = '已扫描，请在 TapTap 中确认';
+      $('#login-status').textContent = '✅ 已扫描，请在 TapTap 中确认登录';
     } else if (d.status === 'success') {
       clearInterval(pollTimer); pollTimer = null;
+      clearInterval(countdownTimer); countdownTimer = null;
       sessionToken = d.session_token;
       isGlobal = d.is_global;
-      $('#login-status').textContent = '登录成功！';
+      $('#login-status').textContent = '✅ 登录成功！正在跳转...';
       setTimeout(() => {
         $('#login-page').style.display = 'none';
         $('#dashboard').style.display = 'block';
         switchTab('b30');
-      }, 500);
-    } else if (d.status === 'expired') {   // 新增处理二维码过期
+      }, 600);
+    } else if (d.status === 'expired') {
       clearInterval(pollTimer); pollTimer = null;
-      $('#login-status').textContent = '二维码已过期，请点击「重新获取」刷新';
+      clearInterval(countdownTimer); countdownTimer = null;
+      $('#login-status').textContent = '⏰ 二维码已过期，请重新获取';
+      $('#login-status').classList.add('error');
       $('#login-btn').disabled = false;
       $('#qr-img').style.display = 'none';
       $('#qr-ph').style.display = 'flex';
     } else if (d.status === 'error') {
-      clearInterval(pollTimer); pollTimer = null;
-      $('#login-status').textContent = '失败: ' + (d.message||'');
-      $('#login-btn').disabled = false;
+      // 不停止轮询，给用户重试机会（服务端没删 session）
+      $('#login-status').textContent = '⚠️ ' + (d.message || '错误');
+      $('#login-status').classList.add('error');
     }
-  } catch(e) {}
+  } catch(e) {
+    // 网络错误，继续重试
+  }
 }
 
 function logout() {
   sessionToken = null; isGlobal = false;
+  if (pollTimer) clearInterval(pollTimer);
+  if (countdownTimer) clearInterval(countdownTimer);
   $('#dashboard').style.display = 'none';
   $('#login-page').style.display = 'flex';
   $('#login-btn').disabled = false;
   $('#login-btn').textContent = '获取二维码';
   $('#login-status').textContent = '';
+  $('#login-status').classList.remove('error');
+  $('#qr-countdown').textContent = '';
   $('#qr-img').style.display = 'none';
   $('#qr-ph').style.display = 'flex';
+  // 清除已加载的数据缓存
+  ['b30','songs','suggest','history'].forEach(t => {
+    const el = $(`#${t}-content`); if (el) { el.innerHTML = ''; el.dataset.loaded = ''; }
+  });
 }
 
 // ===== Tabs =====
@@ -90,15 +153,43 @@ function switchTab(name) {
   else if (name === 'history') loadHistory();
 }
 
+// ===== 骨架屏 =====
+function b30Skeleton(n=8) {
+  let html = '<div class="b30-skeleton">';
+  for (let i = 0; i < n; i++) {
+    html += `<div class="skel-card">
+      <div class="skel-ill skeleton" style="height:0;aspect-ratio:16/9"></div>
+      <div class="skel-body"><div class="skel-line skeleton" style="width:60%"></div>
+      <div class="skel-line skeleton" style="width:40%;height:10px"></div></div>
+    </div>`;
+  }
+  return html + '</div>';
+}
+
+function tableSkeleton(rows=8) {
+  let html = '<div class="table-skeleton"><table class="tbl"><tbody>';
+  for (let i = 0; i < rows; i++) {
+    html += `<tr class="skel-row"><td><div class="skeleton" style="width:20px;height:14px"></div></td>
+    <td><div class="skeleton" style="width:120px;height:14px"></div></td>
+    <td><div class="skeleton" style="width:30px;height:14px"></div></td>
+    <td><div class="skeleton" style="width:30px;height:14px"></div></td>
+    <td><div class="skeleton" style="width:60px;height:14px"></div></td>
+    <td><div class="skeleton" style="width:50px;height:14px"></div></td>
+    <td><div class="skeleton" style="width:40px;height:14px"></div></td>
+    <td><div class="skeleton" style="width:30px;height:14px"></div></td></tr>`;
+  }
+  return html + '</tbody></table></div>';
+}
+
 // ===== B30 =====
 async function loadB30() {
   const el = $('#b30-content');
-  el.innerHTML = '<div class="loading">正在获取存档，请稍候...</div>';
+  el.innerHTML = b30Skeleton();
   try {
     const r = await fetch(`/api/user/b30?session_token=${encodeURIComponent(sessionToken)}&is_global=${isGlobal}`);
     if (!r.ok) { const e = await r.json(); el.innerHTML = `<div class="error">${e.detail||r.statusText}</div>`; return; }
     const d = await r.json();
-    // Header
+
     $('#p-name').textContent = d.player.nickname || '未知';
     $('#p-id').textContent = d.player.player_id ? 'ID: ' + d.player.player_id : '';
     $('#s-rks').textContent = (d.save_rks||0).toFixed(2);
@@ -108,20 +199,21 @@ async function loadB30() {
     $('#s-cleared').textContent = d.stats.cleared || 0;
     $('#s-fc').textContent = d.stats.fc || 0;
     $('#s-phi').textContent = d.stats.phi || 0;
-    // B30 Grid
+
     const b30 = d.b30 || [];
-    if (!b30.length) { el.innerHTML = '<div class="loading">没有成绩数据</div>'; return; }
+    if (!b30.length) { el.innerHTML = '<div class="note">没有成绩数据</div>'; return; }
     el.innerHTML = '<div class="b30-grid"></div>';
     const grid = el.querySelector('.b30-grid');
     b30.forEach((s, i) => {
-      const rankClass = s.acc >= 100 ? 'phi' : '';
+      const rankCls = s.acc >= 100 ? 'phi' : '';
       grid.insertAdjacentHTML('beforeend', `
         <div class="score-card">
-          <img class="ill" loading="lazy" src="${s.illustration}" alt="${esc(s.song)}"
-               onerror="this.style.display='none'">
+          <div class="ill-wrap">
+            <img class="ill" loading="lazy" src="${s.illustration}" alt="${esc(s.song)}" onerror="this.style.display='none'">
+            <div class="rank-badge ${rankCls}">#${i+1}</div>
+          </div>
           <div class="body">
-            <div class="rank ${rankClass}">#${i+1}</div>
-            <div class="song-name">${esc(s.song)}</div>
+            <div class="song-name" title="${esc(s.song)}">${esc(s.song)}</div>
             <div class="meta">
               <span class="diff diff-${s.level}">${s.level} ${s.difficulty.toFixed(1)}</span>
               <span class="rt rt-${s.rating}">${s.rating}</span>
@@ -139,17 +231,16 @@ async function loadB30() {
 // ===== All Scores =====
 async function loadAllScores() {
   const el = $('#songs-content');
-  // 只加载一次
   if (el.dataset.loaded === '1') return;
-  el.innerHTML = '<div class="loading">正在获取全部成绩...</div>';
+  el.innerHTML = tableSkeleton();
   try {
     const r = await fetch(`/api/user/all-scores?session_token=${encodeURIComponent(sessionToken)}&is_global=${isGlobal}`);
     if (!r.ok) { const e = await r.json(); el.innerHTML = `<div class="error">${e.detail}</div>`; return; }
     const d = await r.json();
     const scores = d.scores || [];
-    let html = `<div class="search-box"><input id="song-search" placeholder="搜索曲目名..." oninput="filterSongs()"></div>`;
+    let html = `<div class="search-box"><input id="song-search" placeholder="🔍 搜索曲目名..." oninput="filterSongs()"></div>`;
     html += `<div class="note">共 ${scores.length} 条成绩</div>`;
-    html += '<table class="tbl"><thead><tr><th>#</th><th>曲目</th><th>难度</th><th>定数</th><th>分数</th><th>ACC</th><th>RKS</th><th>评级</th></tr></thead><tbody id="songs-tbody">';
+    html += '<div class="table-wrap"><table class="tbl"><thead><tr><th>#</th><th>曲目</th><th>难度</th><th>定数</th><th>分数</th><th>ACC</th><th>RKS</th><th>评级</th></tr></thead><tbody id="songs-tbody">';
     scores.forEach((s, i) => {
       html += `<tr data-song="${esc(s.song.toLowerCase())}">
         <td>${i+1}</td>
@@ -162,7 +253,7 @@ async function loadAllScores() {
         <td><span class="rt rt-${s.rating}">${s.rating}</span></td>
       </tr>`;
     });
-    html += '</tbody></table>';
+    html += '</tbody></table></div>';
     el.innerHTML = html;
     el.dataset.loaded = '1';
   } catch(e) { el.innerHTML = `<div class="error">${e}</div>`; }
@@ -178,7 +269,7 @@ function filterSongs() {
 // ===== Suggest =====
 async function loadSuggest() {
   const el = $('#suggest-content');
-  el.innerHTML = '<div class="loading">正在计算推分建议...</div>';
+  el.innerHTML = '<div class="loading">⏳ 正在计算推分建议...</div>';
   try {
     const r = await fetch(`/api/user/suggest?session_token=${encodeURIComponent(sessionToken)}&is_global=${isGlobal}`);
     if (!r.ok) { const e = await r.json(); el.innerHTML = `<div class="error">${e.detail}</div>`; return; }
@@ -186,16 +277,15 @@ async function loadSuggest() {
     const sugs = d.suggestions || [];
     let html = `<div class="note">当前 RKS: <b>${d.save_rks}</b> → 目标: <b>${d.target_rks}</b> (需提升 ${d.min_up_rks})</div>`;
     if (!sugs.length) {
-      html += '<div class="note">暂无可推分的曲目，你已经很强了！</div>';
+      html += '<div class="note">🎉 暂无可推分的曲目，你已经很强了！</div>';
     } else {
       html += '<div class="suggest-list">';
       sugs.forEach(s => {
-        const gradeCls = 'grade-' + s.suggest_grade;
         html += `
-          <div class="suggest-card ${gradeCls}">
+          <div class="suggest-card grade-${s.suggest_grade}">
             <img class="ill" loading="lazy" src="${s.illustration}" alt="${esc(s.song)}" onerror="this.style.display='none'">
             <div class="info">
-              <div class="name">${esc(s.song)}</div>
+              <div class="name" title="${esc(s.song)}">${esc(s.song)}</div>
               <div class="meta">
                 <span class="diff diff-${s.level}">${s.level} ${s.difficulty.toFixed(1)}</span>
                 当前 ${s.acc.toFixed(2)}% → RKS ${s.rks.toFixed(2)}
@@ -225,17 +315,15 @@ async function loadHistory() {
       el.innerHTML = '<div class="note">暂无历史记录，每次查看 B30 会自动保存快照</div>';
       return;
     }
-    // RKS 趋势图 (SVG)
-    let html = '<div class="history-chart"><h3 style="margin-bottom:12px">RKS 变化趋势</h3>';
+    let html = '<div class="history-chart"><h3 style="margin-bottom:12px">📈 RKS 变化趋势</h3>';
     html += renderTrendChart(trend);
     html += '</div>';
-    // 列表
     html += '<div class="history-list">';
     trend.slice().reverse().forEach(h => {
       const dt = new Date(h.ts);
       html += `<div class="history-item">
-        <span class="ts">${dt.toLocaleString('zh-CN')}</span>
-        <span class="rks">${(h.save_rks||0).toFixed(2)} / ${(h.computed_rks||0).toFixed(2)}</span>
+        <span style="color:var(--muted);font-size:12px">${dt.toLocaleString('zh-CN')}</span>
+        <span style="font-family:monospace;font-weight:bold;color:var(--accent)">${(h.save_rks||0).toFixed(2)} / ${(h.computed_rks||0).toFixed(2)}</span>
       </div>`;
     });
     html += '</div>';
@@ -245,23 +333,25 @@ async function loadHistory() {
 
 function renderTrendChart(trend) {
   if (trend.length < 2) return '<div class="note">至少需要 2 条记录才能绘制趋势</div>';
-  const w = 700, h = 160, pad = 40;
-  const rksVals = trend.map(t => t.save_rks || 0);
-  const min = Math.min(...rksVals) - 0.1;
-  const max = Math.max(...rksVals) + 0.1;
+  const w = 700, h = 180, pad = 40;
+  const vals = trend.map(t => t.save_rks || 0);
+  const min = Math.min(...vals) - 0.1;
+  const max = Math.max(...vals) + 0.1;
   const range = max - min || 1;
-  const step = (w - pad * 2) / (trend.length - 1);
+  const step = (w - pad * 2) / Math.max(1, trend.length - 1);
   const pts = trend.map((t, i) => {
     const x = pad + i * step;
     const y = h - pad - ((t.save_rks || 0) - min) / range * (h - pad * 2);
     return `${x},${y}`;
   }).join(' ');
+  const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#6ea8fe';
+  const muted = getComputedStyle(document.documentElement).getPropertyValue('--muted').trim() || '#888';
   return `<svg width="100%" height="${h}" viewBox="0 0 ${w} ${h}" style="max-width:700px">
-    <polyline points="${pts}" fill="none" stroke="#6ea8fe" stroke-width="2"/>
+    <polyline points="${pts}" fill="none" stroke="${accent}" stroke-width="2"/>
     ${trend.map((t, i) => {
       const x = pad + i * step;
       const y = h - pad - ((t.save_rks || 0) - min) / range * (h - pad * 2);
-      return `<circle cx="${x}" cy="${y}" r="3" fill="#6ea8fe"/><text x="${x}" y="${y-8}" fill="#888" font-size="10" text-anchor="middle">${(t.save_rks||0).toFixed(2)}</text>`;
+      return `<circle cx="${x}" cy="${y}" r="3" fill="${accent}"/><text x="${x}" y="${y-8}" fill="${muted}" font-size="10" text-anchor="middle">${(t.save_rks||0).toFixed(2)}</text>`;
     }).join('')}
   </svg>`;
 }
