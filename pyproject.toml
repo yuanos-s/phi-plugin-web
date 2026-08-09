@@ -10,7 +10,11 @@ dependencies = [
     "pycryptodome",
     "pyyaml",
     "python-multipart",
+    "python-dotenv",
 ]
+
+[tool.setuptools.packages.find]
+exclude = ["data", "static", "history"]
 
 [tool.uvicorn]
 host = "0.0.0.0"

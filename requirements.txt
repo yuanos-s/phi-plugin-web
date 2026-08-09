@@ -3,3 +3,4 @@ httpx
 pycryptodome
 pyyaml
 python-multipart
+python-dotenv
