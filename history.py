@@ -1,46 +1,73 @@
 """
-历史成绩记录 — Supabase 版本 (无本地回退)
-
-迁移变更:
-  - 移除本地 JSON 存储回退
-  - 所有操作直接走 Supabase
+历史成绩记录 — 已迁移至 Supabase
+此文件为兼容层，实际调用 db.py 中的函数
 """
 import json
-import os
+from typing import List, Dict, Any
 
-try:
-    from db import _is_configured, save_history, get_history
-    _sb_ok = True
-except Exception:
-    _sb_ok = False
-    _is_configured = lambda: False
+# 导入 Supabase 函数
+from db import save_b30_history, get_b30_history_for_user, get_user_by_session_token
 
 
-async def save_snapshot(user_id: str, b30: list, rks: float, computed_rks: float):
-    """保存 B30 快照到 Supabase"""
-    if not _sb_ok or not _is_configured():
+def save_snapshot(session_token: str, player_name: str, b30: list, rks: float, computed_rks: float):
+    """
+    保存 B30 快照到 Supabase
+    """
+    import asyncio
+
+    # 获取 user_id
+    user = asyncio.run(get_user_by_session_token(session_token))
+    if not user:
+        print(f"[WARN] 用户不存在，无法保存快照: {session_token[:8]}")
         return
+
+    # 调用 Supabase 保存
     try:
-        b30_data = [{"song": s.get("song",""), "song_id": s.get("song_id",""),
-                     "level": s.get("level",""), "score": s.get("score",0),
-                     "acc": s.get("acc",0), "rks": s.get("rks",0),
-                     "fc": s.get("fc",False), "difficulty": s.get("difficulty",0)}
-                    for s in b30]
-        await save_history(user_id, rks, computed_rks, b30_data)
-    except Exception:
-        pass
+        asyncio.run(save_b30_history(
+            user_id=user["id"],
+            save_rks=rks,
+            computed_rks=computed_rks,
+            b30_data=b30
+        ))
+    except Exception as e:
+        print(f"[ERROR] 保存历史快照失败: {e}")
 
 
-async def get_history_async(user_id: str) -> list:
-    """获取历史列表"""
-    if not _sb_ok or not _is_configured():
+def get_history(session_token: str) -> List[Dict[str, Any]]:
+    """
+    获取历史记录（从 Supabase）
+    """
+    import asyncio
+
+    user = asyncio.run(get_user_by_session_token(session_token))
+    if not user:
         return []
-    try:
-        return await get_history(user_id)
-    except Exception:
-        return []
+
+    history = asyncio.run(get_b30_history_for_user(user["id"]))
+    # 转换为旧格式兼容
+    result = []
+    for h in history:
+        result.append({
+            "ts": h["created_at"],
+            "player_name": "",
+            "save_rks": h["save_rks"],
+            "computed_rks": h["computed_rks"],
+            "b30": h.get("b30_data", [])
+        })
+    return result
 
 
-def get_rks_trend(user_id: str = None) -> list:
-    """本地无数据，返回空列表"""
-    return []
+def get_rks_trend(session_token: str) -> List[Dict[str, Any]]:
+    """
+    获取 RKS 变化趋势
+    """
+    history = get_history(session_token)
+    return [
+        {
+            "ts": h["ts"],
+            "save_rks": h["save_rks"],
+            "computed_rks": h["computed_rks"],
+            "player_name": h.get("player_name", "")
+        }
+        for h in history
+    ]
