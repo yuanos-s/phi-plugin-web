@@ -75,6 +75,9 @@ async def api_check(session_id: str):
         return {"status": "waiting"}
     elif result["status"] == "scanned":
         return {"status": "scanned"}
+    elif result["status"] == "expired":          # ← 新增处理过期状态
+        del _login_sessions[session_id]
+        return {"status": "expired", "message": "二维码已过期，请重新获取"}
     else:
         del _login_sessions[session_id]
         return {"status": "error", "message": result.get("message", "")}
@@ -107,7 +110,6 @@ async def api_user_info(session_token: str, is_global: bool = False):
 
 
 def _build_score_list(game_record: dict) -> list:
-    """从 game_record 构建带定数的成绩列表"""
     all_scores = []
     for song_id, levels in game_record.get("records", {}).items():
         for lv_idx, rec in enumerate(levels):
@@ -141,16 +143,13 @@ async def api_b30(session_token: str, is_global: bool = False):
     summary = save.get("summary", {})
     player = save.get("player", {})
 
-    # 计算真实 RKS (top27 + 3个phi)
     phi_scores = [s for s in all_scores if s["acc"] >= 100][:3]
     phi_rks = sum(s["rks"] for s in phi_scores)
     com_rks = (sum(s["rks"] for s in b30[:27]) + phi_rks) / 30 if b30 else 0
 
-    # 保存历史快照
     save_snapshot(session_token, player.get("nickname", ""), b30,
                   summary.get("ranking_score", 0), round(com_rks, 4))
 
-    # 统计
     total_cleared = sum(summary.get("cleared", [0]*4))
     total_fc = sum(summary.get("full_combo", [0]*4))
     total_phi = sum(summary.get("phi", [0]*4))
