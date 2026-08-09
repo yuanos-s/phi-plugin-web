@@ -1,6 +1,7 @@
 """
 TapTap OAuth2 Device Code 登录 + LeanCloud sessionToken 获取
 """
+import os
 import time
 import hmac
 import hashlib
@@ -9,16 +10,20 @@ import random
 import string
 import httpx
 
-# ===== 注意：以下 CN_CLIENT_ID 和 CN_APP_KEY 实际上是 LeanCloud 的凭证 =====
-# 如果它们失效，你需要注册自己的 LeanCloud 应用并替换
-CN_CLIENT_ID = "rAK3FfdieFob2Nn8Am"
-CN_APP_KEY   = "Qr9AEqtuoSVS3zeD6iVbM4ZC0AtkJcQ89tywVyi0"
+# ===== 从环境变量读取敏感凭证 =====
+# 在部署平台（如 FastAPI Cloud）设置环境变量 TAP_CLIENT_ID
+# 本地开发时，可以在 .env 文件中设置
+TAP_CLIENT_ID = os.getenv("TAP_CLIENT_ID", "6eap1uf29vab4y7pal")  # 默认值方便测试，但线上必须用环境变量
+
+# ===== LeanCloud 凭证（同样建议使用环境变量） =====
+CN_CLIENT_ID = os.getenv("CN_LC_ID", "rAK3FfdieFob2Nn8Am")
+CN_APP_KEY   = os.getenv("CN_LC_KEY", "Qr9AEqtuoSVS3zeD6iVbM4ZC0AtkJcQ89tywVyi0")
 CN_TAP_AUTH  = "https://accounts.tapapis.cn"
 CN_TAP_API   = "https://open.tapapis.cn"
 CN_LC_BASE   = "https://rak3ffdi.cloud.tds1.tapapis.cn/1.1"
 
-GB_CLIENT_ID = "kviehleldgxsagpozb"
-GB_APP_KEY   = "tG9CTm0LDD736k9HMM9lBZrbeBGRmUkjSfNLDNib"
+GB_CLIENT_ID = os.getenv("GB_LC_ID", "kviehleldgxsagpozb")
+GB_APP_KEY   = os.getenv("GB_LC_KEY", "tG9CTm0LDD736k9HMM9lBZrbeBGRmUkjSfNLDNib")
 GB_TAP_AUTH  = "https://accounts.tapapis.com"
 GB_TAP_API   = "https://open.tapapis.com"
 GB_LC_BASE   = "https://kviehlel.cloud.ap-sg.tapapis.com/1.1"
@@ -35,8 +40,10 @@ def _rand_dev_id():
 
 
 async def request_qrcode(is_global=False):
-    cid, _, auth_base, _, _ = _cfg(is_global)
+    cid = TAP_CLIENT_ID
     dev_id = _rand_dev_id()
+    # 固定国服地址（因为你的 Client ID 是中国大陆的）
+    auth_base = "https://accounts.tapapis.cn"
     files = {
         "client_id": (None, cid),
         "response_type": (None, "device_code"),
@@ -54,7 +61,8 @@ async def request_qrcode(is_global=False):
 
 
 async def poll_login(device_code, device_id, is_global=False):
-    cid, _, auth_base, _, _ = _cfg(is_global)
+    cid = TAP_CLIENT_ID
+    auth_base = "https://accounts.tapapis.cn"
     files = {
         "grant_type": (None, "device_token"),
         "client_id": (None, cid),
@@ -83,7 +91,7 @@ async def poll_login(device_code, device_id, is_global=False):
     if err == "authorization_scanned":
         return {"status": "scanned"}
     if err == "invalid_grant_code":
-        return {"status": "expired"}  # 二维码过期
+        return {"status": "expired"}
     if err:
         return {"status": "error", "message": err}
     return {"status": "waiting"}
@@ -103,7 +111,8 @@ def _mac_auth(url, method, kid, mac_key):
 
 
 async def get_profile(token, is_global=False):
-    cid, _, _, api_base, _ = _cfg(is_global)
+    api_base = "https://open.tapapis.cn"
+    cid = TAP_CLIENT_ID
     url = f"{api_base}/account/profile/v1?client_id={cid}"
     auth = _mac_auth(url, "GET", token["kid"], token["mac_key"])
     async with httpx.AsyncClient(timeout=20) as c:
