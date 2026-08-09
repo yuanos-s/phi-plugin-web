@@ -9,8 +9,8 @@ from typing import Optional
 
 LEVELS = ["EZ", "HD", "IN", "AT", "LEGACY"]
 DATA_DIR = Path(__file__).parent / "data"
-ILL_BASE = "https://raw.githubusercontent.com/Catrong/phi-plugin-ill/main/ill"
-ILL_PROXY = "https://gh-proxy.com"
+ILL_BASE = os.getenv("PHI_ILL_BASE", "https://raw.githubusercontent.com/Catrong/phi-plugin-ill/main/ill")
+ILL_PROXY = os.getenv("PHI_ILL_PROXY", "https://gh-proxy.com")
 
 _song_info: dict = {}
 _chapters: dict = {}

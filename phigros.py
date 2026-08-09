@@ -1,28 +1,17 @@
 """
-Phigros 存档获取、AES 解密、二进制解析
+Phigros 存档解析 (无 LeanCloud)
 
-修复:
-  #8  LeanCloud 凭证改为从环境变量读取，与 taptap.py 一致
-  #11 decrypt_save 加 PKCS7 校验和空数据保护
-  #12 BinaryReader 加越界保护
+迁移变更:
+  - 移除所有 LeanCloud API 调用 (lc_get_player_info, lc_get_saves, fetch_zip, get_full_save)
+  - 保留 AES 解密 + 二进制解析 (这些与存储无关)
+  - 新增 parse_uploaded_save(): 接收上传的 ZIP bytes, 返回解析后的完整存档
 """
 import struct
 import base64
 import zipfile
 import io
 import json
-import os
-import httpx
 from Crypto.Cipher import AES
-
-# BUG #8: 从环境变量读取，与 taptap.py 一致
-CN_CLIENT_ID = os.getenv("CN_LC_ID", "rAK3FfdieFob2Nn8Am")
-CN_APP_KEY   = os.getenv("CN_LC_KEY", "Qr9AEqtuoSVS3zeD6iVbM4ZC0AtkJcQ89tywVyi0")
-CN_LC_BASE   = "https://rak3ffdi.cloud.tds1.tapapis.cn/1.1"
-
-GB_CLIENT_ID = os.getenv("GB_LC_ID", "kviehleldgxsagpozb")
-GB_APP_KEY   = os.getenv("GB_LC_KEY", "tG9CTm0LDD736k9HMM9lBZrbeBGRmUkjSfNLDNib")
-GB_LC_BASE   = "https://kviehlel.cloud.ap-sg.tapapis.com/1.1"
 
 AES_KEY = base64.b64decode("6Jaa0qVAJZuXkZCLiOa/Ax5tIZVu+taKUN1V1nqwkks=")
 AES_IV = base64.b64decode("Kk/wisgNYwcAV8WVGMgyUw==")
@@ -30,13 +19,6 @@ AES_IV = base64.b64decode("Kk/wisgNYwcAV8WVGMgyUw==")
 LEVELS = ["EZ", "HD", "IN", "AT", "LEGACY"]
 
 
-def _cfg(is_global):
-    if is_global:
-        return GB_CLIENT_ID, GB_APP_KEY, GB_LC_BASE
-    return CN_CLIENT_ID, CN_APP_KEY, CN_LC_BASE
-
-
-# ===== Binary Reader (BUG #12: 加越界保护) =====
 class BinaryReader:
     def __init__(self, data: bytes):
         self.data = data
@@ -84,7 +66,6 @@ class BinaryReader:
         return self.data[self.pos-length:self.pos].decode("utf-8", errors="replace")
 
 
-# BUG #11: 加 PKCS7 校验和空数据保护
 def decrypt_save(ciphertext: bytes) -> bytes:
     if not ciphertext or len(ciphertext) == 0:
         raise ValueError("空密文")
@@ -92,12 +73,10 @@ def decrypt_save(ciphertext: bytes) -> bytes:
         raise ValueError(f"密文长度非 16 倍数: {len(ciphertext)}")
     cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_IV)
     plain = cipher.decrypt(ciphertext)
-    # PKCS7 校验
     if len(plain) == 0:
         return plain
     pad = plain[-1]
     if 1 <= pad <= 16:
-        # 校验最后 pad 个字节都等于 pad
         if all(b == pad for b in plain[-pad:]):
             plain = plain[:-pad]
     return plain
@@ -126,7 +105,7 @@ def parse_game_record(data: bytes) -> dict:
     while r.remaining() > 0:
         try:
             sid = r.get_string()
-            r.get_varint()  # skip
+            r.get_varint()
             lvl_mask = r.get_byte()
             fc_mask = r.get_byte()
             levels = []
@@ -140,7 +119,7 @@ def parse_game_record(data: bytes) -> dict:
                     levels.append(None)
             records[sid] = levels
         except IndexError:
-            break  # 数据截断，停止解析
+            break
     return {"song_count": count, "records": records}
 
 
@@ -159,55 +138,21 @@ def parse_game_progress(data: bytes) -> dict:
             "money": [r.get_varint() for _ in range(5)]}
 
 
-# ===== LeanCloud API =====
-async def lc_get_player_info(session_token, is_global=False):
-    cid, akey, base = _cfg(is_global)
-    headers = {"X-LC-Id": cid, "X-LC-Key": akey, "X-LC-Session": session_token,
-               "User-Agent": "LeanCloud-CSharp-SDK/1.0.3", "Accept": "application/json"}
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.get(f"{base}/users/me", headers=headers)
-        r.raise_for_status()
-        return r.json()
+def parse_uploaded_save(zip_data: bytes) -> dict:
+    """
+    解析用户上传的 Phigros 存档 ZIP
 
+    存档 ZIP 内含:
+      - gameRecord: 首字节=版本号, 其余=AES-CBC 密文
+      - user: 同上
+      - settings: 同上
+      - gameProgress: 同上
 
-async def lc_get_saves(session_token, object_id, is_global=False):
-    cid, akey, base = _cfg(is_global)
-    headers = {"X-LC-Id": cid, "X-LC-Key": akey, "X-LC-Session": session_token,
-               "User-Agent": "LeanCloud-CSharp-SDK/1.0.3", "Accept": "application/json"}
-    where = json.dumps({"user": {"__type": "Pointer", "className": "_User", "objectId": object_id}})
-    params = {"skip": "0", "limit": "100", "where": where, "include": "cover,gameFile"}
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.get(f"{base}/gamesaves/", headers=headers, params=params)
-        r.raise_for_status()
-        return r.json().get("results", [])
-
-
-async def fetch_zip(url: str) -> bytes:
-    async with httpx.AsyncClient(timeout=60) as c:
-        r = await c.get(url)
-        r.raise_for_status()
-        return r.content
-
-
-async def get_full_save(session_token, is_global=False):
-    player = await lc_get_player_info(session_token, is_global)
-    saves = await lc_get_saves(session_token, player["objectId"], is_global)
-    if not saves:
-        raise ValueError("未找到存档，请确认已在游戏中同步存档")
-    saves.sort(key=lambda s: s.get("modifiedAt", {}).get("iso", ""), reverse=True)
-    save_info = saves[0]
-    if not save_info.get("gameFile"):
-        raise ValueError("存档中没有 gameFile")
-    save_url = save_info["gameFile"]["url"]
-    summary = {}
-    if save_info.get("summary"):
-        try:
-            summary = parse_summary(save_info["summary"])
-        except Exception:
-            pass
-    zip_data = await fetch_zip(save_url)
+    返回: {game_record, game_user, game_progress, summary}
+    """
     zf = zipfile.ZipFile(io.BytesIO(zip_data))
     game_record, game_user, game_progress = {}, {}, {}
+
     for name, parser in [("gameRecord", parse_game_record), ("user", parse_game_user),
                          ("gameProgress", parse_game_progress)]:
         if name in zf.namelist():
@@ -222,9 +167,24 @@ async def get_full_save(session_token, is_global=False):
                         game_user = result
                     elif name == "gameProgress":
                         game_progress = result
-                except Exception:
-                    pass
-    return {"player": player, "save_info": {"modified_at": save_info.get("modifiedAt", {}),
-                                            "created_at": save_info.get("createdAt", "")},
-            "summary": summary, "game_record": game_record,
-            "game_user": game_user, "game_progress": game_progress}
+                except Exception as e:
+                    raise ValueError(f"解析 {name} 失败: {e}")
+
+    # summary 不在 ZIP 内，从 gameProgress 推断或留空
+    # summary 通常存在于 LeanCloud 的存档元数据中，上传的 ZIP 可能不含
+    # 如果有 summary 文件则解析
+    if "summary" in zf.namelist():
+        try:
+            summary_raw = zf.read("summary")
+            summary = parse_summary(summary_raw.decode("utf-8").strip())
+        except Exception:
+            summary = {}
+    else:
+        summary = {}
+
+    return {
+        "game_record": game_record,
+        "game_user": game_user,
+        "game_progress": game_progress,
+        "summary": summary,
+    }

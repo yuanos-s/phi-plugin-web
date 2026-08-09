@@ -210,7 +210,7 @@ function logout() {
   $('#qr-countdown').textContent = '';
   $('#qr-img').style.display = 'none';
   $('#qr-ph').style.display = 'flex';
-  ['b30','songs','suggest','history','leaderboard'].forEach(t => {
+  ['b30','songs','suggest','history','leaderboard','upload'].forEach(t => {
     const el = $(`#${t}-content`); if (el) { el.innerHTML = ''; el.dataset.loaded = ''; }
   });
 }
@@ -225,6 +225,7 @@ function switchTab(name) {
   else if (name === 'suggest') loadSuggest();
   else if (name === 'history') loadHistory();
   else if (name === 'leaderboard') loadLeaderboard();
+  else if (name === 'upload') loadUpload();
 }
 
 // ===== 骨架屏 =====
@@ -264,6 +265,11 @@ async function loadB30() {
     const r = await fetch(url);
     if (!r.ok) { const e = await r.json(); el.innerHTML = `<div class="error">${e.detail||r.statusText}</div>`; return; }
     const d = await r.json();
+
+    if (d.no_data) {
+      el.innerHTML = `<div class="note">📭 ${d.message || '暂无存档数据'}<br><br>请点击「上传存档」标签上传 Phigros 存档文件</div>`;
+      return;
+    }
 
     $('#p-name').textContent = d.player.nickname || cachedPlayerName || '未知';
     $('#p-id').textContent = d.player.player_id ? 'ID: ' + d.player.player_id : '';
@@ -312,6 +318,7 @@ async function loadAllScores() {
     const r = await fetch(`/api/user/all-scores?session_token=${encodeURIComponent(sessionToken)}&is_global=${isGlobal}`);
     if (!r.ok) { const e = await r.json(); el.innerHTML = `<div class="error">${e.detail}</div>`; return; }
     const d = await r.json();
+    if (d.no_data) { el.innerHTML = '<div class="note">📭 暂无存档数据，请先上传存档</div>'; return; }
     const scores = d.scores || [];
     let html = `<div class="search-box"><input id="song-search" placeholder="🔍 搜索曲目名..." oninput="filterSongs()"></div>`;
     html += `<div class="note">共 ${scores.length} 条成绩</div>`;
@@ -346,6 +353,7 @@ async function loadSuggest() {
     const r = await fetch(`/api/user/suggest?session_token=${encodeURIComponent(sessionToken)}&is_global=${isGlobal}`);
     if (!r.ok) { const e = await r.json(); el.innerHTML = `<div class="error">${e.detail}</div>`; return; }
     const d = await r.json();
+    if (d.no_data) { el.innerHTML = '<div class="note">📭 暂无存档数据，请先上传存档</div>'; return; }
     const sugs = d.suggestions || [];
     let html = `<div class="note">当前 RKS: <b>${d.save_rks}</b> → 目标: <b>${d.target_rks}</b> (需提升 ${d.min_up_rks})</div>`;
     if (!sugs.length) {
@@ -460,6 +468,69 @@ async function loadLeaderboard() {
     el.innerHTML = html;
     el.dataset.loaded = '1';
   } catch(e) { el.innerHTML = `<div class="error">${e}</div>`; }
+}
+
+// ===== Upload Archive =====
+function loadUpload() {
+  const el = $('#upload-content');
+  el.innerHTML = `
+    <div class="note">📁 上传 Phigros 存档文件 (.zip)<br>存档位置: Android → /Android/data/com.PigeonGames.Phigros/files/ <br>iOS → 通过 Filza 或类似文件管理器导出</div>
+    <div id="upload-zone" style="border:2px dashed var(--border);border-radius:var(--radius);padding:40px;text-align:center;cursor:pointer;transition:var(--transition)" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
+      <div style="font-size:32px;margin-bottom:8px">📦</div>
+      <div style="color:var(--muted)">点击或拖拽文件到此处上传</div>
+      <input type="file" id="upload-input" accept=".zip,.dat" style="display:none" onchange="handleUpload(this.files[0])">
+    </div>
+    <div id="upload-status" style="margin-top:12px"></div>
+    <div id="upload-result" style="margin-top:12px"></div>
+  `;
+  const zone = $('#upload-zone');
+  zone.onclick = () => $('#upload-input').click();
+  zone.ondragover = (e) => { e.preventDefault(); zone.style.borderColor = 'var(--accent)'; };
+  zone.ondragleave = () => { zone.style.borderColor = 'var(--border)'; };
+  zone.ondrop = (e) => {
+    e.preventDefault();
+    zone.style.borderColor = 'var(--border)';
+    if (e.dataTransfer.files.length) handleUpload(e.dataTransfer.files[0]);
+  };
+}
+
+async function handleUpload(file) {
+  if (!file) return;
+  if (!sessionToken) { $('#upload-status').innerHTML = '<div class="error">请先登录</div>'; return; }
+  if (file.size > 50 * 1024 * 1024) {
+    $('#upload-status').innerHTML = '<div class="error">文件过大 (最大 50MB)</div>'; return;
+  }
+  $('#upload-status').innerHTML = '<div class="loading">⏳ 正在上传并解析存档...</div>';
+  $('#upload-result').innerHTML = '';
+  const formData = new FormData();
+  formData.append('file', file);
+  try {
+    const r = await fetch(`/api/user/upload-archive?session_token=${encodeURIComponent(sessionToken)}`, {
+      method: 'POST', body: formData
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      $('#upload-status').innerHTML = `<div class="error">上传失败: ${d.detail || r.statusText}</div>`;
+      return;
+    }
+    $('#upload-status').innerHTML = '<div class="note" style="color:var(--green)">✅ 上传成功！</div>';
+    $('#upload-result').innerHTML = `
+      <div class="player-card">
+        <div class="player-stats">
+          <div class="stat"><div class="label">RKS</div><div class="value">${(d.save_rks||0).toFixed(2)}</div></div>
+          <div class="stat"><div class="label">计算RKS</div><div class="value green">${(d.computed_rks||0).toFixed(2)}</div></div>
+          <div class="stat"><div class="label">曲目数</div><div class="value">${d.total_songs||0}</div></div>
+          <div class="stat"><div class="label">B30</div><div class="value">${d.b30_count||0}</div></div>
+        </div>
+      </div>
+      <div class="note">数据已保存，点击 B30 标签查看成绩</div>`;
+    // 清除已加载的数据缓存，强制重新加载
+    ['b30','songs','suggest','history'].forEach(t => {
+      const el = $(`#${t}-content`); if (el) { el.innerHTML = ''; el.dataset.loaded = ''; }
+    });
+  } catch(e) {
+    $('#upload-status').innerHTML = `<div class="error">上传失败: ${e}</div>`;
+  }
 }
 
 // ===== Utils =====

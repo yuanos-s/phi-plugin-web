@@ -1,33 +1,42 @@
 """
-Supabase REST API 客户端 (基于 httpx)
+Supabase REST API 客户端 (彻底迁移版)
 
-修复:
-  #6  _headers 改为函数调用，不再在模块加载时固定
-  #7  updated_at 不再发 "NOW()" 字符串，省略让 DB 默认值处理
+变更:
+  - 移除 LeanCloud 相关
+  - 新增 archives 表操作 (存档上传后存储)
+  - 用户 upsert 返回 session_token (UUID)
+  - 支持 SERVICE_KEY (admin 操作)
 """
 import os
 import json
+import uuid
 import httpx
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
 
 def _is_configured() -> bool:
-    return bool(SUPABASE_URL and SUPABASE_KEY)
+    return bool(SUPABASE_URL and SUPABASE_ANON_KEY)
+
+
+def _get_key() -> str:
+    """优先用 service_key, 否则用 anon_key"""
+    return SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
 
 
 def _get_headers() -> dict:
-    """动态构建 headers，确保环境变量生效"""
+    key = _get_key()
     return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
         "Prefer": "return=representation",
     }
 
 
-async def _request(method: str, table: str, params: dict = None, body: dict = None) -> list | dict:
+async def _request(method, table, params=None, body=None):
     if not _is_configured():
         raise RuntimeError("SUPABASE_URL / SUPABASE_ANON_KEY 未配置")
     url = f"{SUPABASE_URL}/rest/v1/{table}"
@@ -36,7 +45,6 @@ async def _request(method: str, table: str, params: dict = None, body: dict = No
         r = await c.request(method, url, headers=headers, params=params, json=body)
         if r.status_code >= 400:
             raise RuntimeError(f"Supabase {r.status_code}: {r.text[:300]}")
-        # 空响应体处理
         if not r.text.strip():
             return []
         return r.json()
@@ -45,18 +53,31 @@ async def _request(method: str, table: str, params: dict = None, body: dict = No
 # ===== 用户操作 =====
 
 async def upsert_user(taptap_openid: str, player_name: str,
-                      session_token: str, is_global: bool) -> dict:
+                      avatar_url: str = "", is_global: bool = False) -> dict:
+    """创建或更新用户，返回 {id, session_token}"""
+    # 先查是否已存在
+    existing = await get_user_by_openid(taptap_openid)
+    if existing:
+        # 更新名字/头像
+        await _request("PATCH", "users",
+            params={"taptap_openid": f"eq.{taptap_openid}"},
+            body={"player_name": player_name, "avatar_url": avatar_url,
+                  "is_global": is_global})
+        return existing
+
+    # 新建：生成 session_token (UUID)
+    session_token = str(uuid.uuid4())
     body = {
         "taptap_openid": taptap_openid,
         "player_name": player_name,
+        "avatar_url": avatar_url,
         "session_token": session_token,
         "is_global": is_global,
-        # BUG #7: 不发 "NOW()"，让 DB 的 DEFAULT NOW() 处理
     }
-    result = await _request("POST", "users",
-        params={"on_conflict": "taptap_openid"},
-        body=body)
-    return result[0] if isinstance(result, list) and result else {}
+    result = await _request("POST", "users", body=body)
+    return result[0] if isinstance(result, list) and result else {
+        "id": None, "session_token": session_token
+    }
 
 
 async def get_user_by_openid(taptap_openid: str) -> dict | None:
@@ -71,13 +92,46 @@ async def get_user_by_token(session_token: str) -> dict | None:
     return result[0] if isinstance(result, list) and result else None
 
 
-async def update_session_token(taptap_openid: str, session_token: str):
-    await _request("PATCH", "users",
-        params={"taptap_openid": f"eq.{taptap_openid}"},
-        body={"session_token": session_token})
+# ===== 存档操作 =====
+
+async def save_archive(user_id: str, game_record: dict, summary: dict,
+                       game_user: dict, b30_data: list,
+                       save_rks: float, computed_rks: float,
+                       total_songs: int) -> str:
+    """保存存档解析结果，返回 archive id"""
+    body = {
+        "user_id": user_id,
+        "game_record": json.dumps(game_record),
+        "summary": json.dumps(summary),
+        "game_user": json.dumps(game_user),
+        "b30_data": json.dumps(b30_data),
+        "save_rks": save_rks,
+        "computed_rks": computed_rks,
+        "total_songs": total_songs,
+    }
+    result = await _request("POST", "archives", body=body)
+    return result[0].get("id") if isinstance(result, list) and result else None
 
 
-# ===== 历史快照 =====
+async def get_latest_archive(user_id: str) -> dict | None:
+    """获取用户最新存档"""
+    result = await _request("GET", "archives",
+        params={"user_id": f"eq.{user_id}",
+                "order": "created_at.desc",
+                "limit": "1"})
+    return result[0] if isinstance(result, list) and result else None
+
+
+async def get_all_archives(user_id: str, limit: int = 50) -> list:
+    """获取用户所有存档"""
+    result = await _request("GET", "archives",
+        params={"user_id": f"eq.{user_id}",
+                "order": "created_at.desc",
+                "limit": str(limit)})
+    return result if isinstance(result, list) else []
+
+
+# ===== B30 历史快照 =====
 
 async def save_history(user_id: str, save_rks: float, computed_rks: float, b30_data: list):
     body = {
