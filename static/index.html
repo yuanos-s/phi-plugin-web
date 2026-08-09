@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phi-Plugin Web — Phigros 查分</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- ===== 登录页 ===== -->
+<div id="login-page" class="login-wrap">
+  <div class="login-card">
+    <h1>Phi-Plugin Web</h1>
+    <p class="sub">Phigros 查分 — TapTap 扫码登录</p>
+    <div class="server-toggle">
+      <button id="cn-btn" class="active" onclick="selectServer(false)">国服</button>
+      <button id="gb-btn" onclick="selectServer(true)">国际服</button>
+    </div>
+    <div id="qr-img"><img id="qr-img-el" alt="二维码"></div>
+    <div id="qr-ph">点击下方按钮获取二维码</div>
+    <div class="login-status" id="login-status"></div>
+    <button class="btn" id="login-btn" onclick="startLogin()">获取二维码</button>
+  </div>
+</div>
+
+<!-- ===== 仪表盘 ===== -->
+<div id="dashboard" style="display:none">
+  <div class="container">
+    <div class="header">
+      <h1>Phi-Plugin Web</h1>
+      <div class="player-info">
+        <div class="avatar">🎵</div>
+        <div>
+          <div id="p-name" style="font-weight:600">--</div>
+          <div id="p-id" style="font-size:12px;color:var(--muted)"></div>
+        </div>
+        <button class="btn-sm" style="background:#8a3a3a;margin-left:12px" onclick="logout()">退出</button>
+      </div>
+    </div>
+
+    <div class="player-card">
+      <div class="player-stats">
+        <div class="stat"><div class="label">RKS (存档)</div><div class="value" id="s-rks">--</div></div>
+        <div class="stat"><div class="label">RKS (计算)</div><div class="value green" id="s-com-rks">--</div></div>
+        <div class="stat"><div class="label">课题段位</div><div class="value gold" id="s-rank">--</div></div>
+        <div class="stat"><div class="label">曲目数</div><div class="value" id="s-songs">--</div></div>
+        <div class="stat"><div class="label">已通关</div><div class="value" id="s-cleared">--</div></div>
+        <div class="stat"><div class="label">FC</div><div class="value" id="s-fc">--</div></div>
+        <div class="stat"><div class="label">Phi</div><div class="value gold" id="s-phi">--</div></div>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="b30" onclick="switchTab('b30')">B30</button>
+      <button class="tab" data-tab="songs" onclick="switchTab('songs')">全部成绩</button>
+      <button class="tab" data-tab="suggest" onclick="switchTab('suggest')">推分建议</button>
+      <button class="tab" data-tab="history" onclick="switchTab('history')">历史成绩</button>
+    </div>
+
+    <div class="tab-content active" data-tab="b30" id="b30-content"></div>
+    <div class="tab-content" data-tab="songs" id="songs-content"></div>
+    <div class="tab-content" data-tab="suggest" id="suggest-content"></div>
+    <div class="tab-content" data-tab="history" id="history-content"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
