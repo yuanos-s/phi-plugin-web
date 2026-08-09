@@ -3,6 +3,8 @@ TapTap OAuth2 Device Code 登录 + LeanCloud sessionToken 获取
 """
 import time, hmac, hashlib, base64, random, string, httpx
 
+# 注意：以下 CN_CLIENT_ID 和 CN_APP_KEY 实际上是 LeanCloud 的凭证
+# 如果它们失效，你需要注册自己的 LeanCloud 应用并替换
 CN_CLIENT_ID = "rAK3FfdieFob2Nn8Am"
 CN_APP_KEY   = "Qr9AEqtuoSVS3zeD6iVbM4ZC0AtkJcQ89tywVyi0"
 CN_TAP_AUTH  = "https://accounts.tapapis.cn"
@@ -58,14 +60,12 @@ async def poll_login(device_code, device_id, is_global=False):
         token = resp.get("data", resp)
         return {"status": "success", "token": token}
 
-    # 提取错误信息（兼容不同响应结构）
     err = None
     if isinstance(resp.get("data"), dict):
         err = resp.get("data", {}).get("error")
     if not err:
         err = resp.get("error")
 
-    # 处理常见的等待/扫描状态
     if err in ("authorization_waiting", "authorization_pending"):
         return {"status": "waiting"}
     if err == "authorization_scanned":
@@ -101,9 +101,25 @@ async def get_session_token(profile, token, is_global=False):
     cid, app_key, _, _, lc_base = _cfg(is_global)
     ts = str(int(time.time()))
     sign = hashlib.md5(f"{ts}{app_key}".encode()).hexdigest()
-    headers = {"X-LC-Id": cid, "Content-Type": "application/json",
-               "X-LC-Sign": f"{sign},{ts}"}
-    body = {"authData": {"taptap": {**profile, **token}}}
+    headers = {
+        "X-LC-Id": cid,
+        "Content-Type": "application/json",
+        "X-LC-Sign": f"{sign},{ts}",
+    }
+    # 从 profile 中提取 openid（TapTap 用户唯一标识）
+    openid = profile.get("openid") or profile.get("id") or profile.get("uid")
+    if not openid:
+        raise ValueError("无法从 TapTap profile 中获取 openid")
+    auth_data = {
+        "openid": openid,
+        "access_token": token.get("access_token"),
+        "expires_in": token.get("expires_in", 86400),
+    }
+    body = {"authData": {"taptap": auth_data}}
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.post(f"{lc_base}/users", json=body, headers=headers)
-        return r.json()
+        resp = r.json()
+    # 检查 LeanCloud 是否返回错误
+    if "error" in resp or "code" in resp:
+        raise RuntimeError(f"LeanCloud 返回错误: {resp}")
+    return resp
