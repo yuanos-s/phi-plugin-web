@@ -33,9 +33,18 @@ except Exception:
 logger = logging.getLogger("phi-web")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Phi-Plugin Web")
+app = FastAPI(title="Phi-Plugin Web", redirect_slashes=False)
 _login_sessions: dict = {}
 _SESSION_TTL = 300  # 5 分钟
+
+
+@app.middleware("http")
+async def strip_trailing_slash(request, call_next):
+    """剥离末尾斜杠，防止 301 重定向丢失 query params"""
+    path = request.url.path
+    if path != '/' and path.endswith('/'):
+        request.scope['path'] = path.rstrip('/')
+    return await call_next(request)
 
 
 def _cleanup_sessions():
