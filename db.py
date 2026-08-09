@@ -1,161 +1,174 @@
 """
-Supabase REST API 客户端 (彻底迁移版)
-
-变更:
-  - 移除 LeanCloud 相关
-  - 新增 archives 表操作 (存档上传后存储)
-  - 用户 upsert 返回 session_token (UUID)
-  - 支持 SERVICE_KEY (admin 操作)
+Supabase 数据库交互模块
 """
 import os
 import json
-import uuid
-import httpx
+from typing import Optional, List, Dict, Any
+from supabase import create_client, Client
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+# 初始化 Supabase 客户端
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # 用于管理操作
 
+# 优先使用 service_key，否则使用 anon_key
+SUPABASE_KEY = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
 
-def _is_configured() -> bool:
-    return bool(SUPABASE_URL and SUPABASE_ANON_KEY)
+_sb: Optional[Client] = None
 
+def get_supabase_client() -> Client:
+    global _sb
+    if _sb is None:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise ValueError("Supabase URL and key must be set in environment")
+        _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _sb
 
-def _get_key() -> str:
-    """优先用 service_key, 否则用 anon_key"""
-    return SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
-
-
-def _get_headers() -> dict:
-    key = _get_key()
-    return {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "Prefer": "return=representation",
-    }
-
-
-async def _request(method, table, params=None, body=None):
-    if not _is_configured():
-        raise RuntimeError("SUPABASE_URL / SUPABASE_ANON_KEY 未配置")
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
-    headers = _get_headers()
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.request(method, url, headers=headers, params=params, json=body)
-        if r.status_code >= 400:
-            raise RuntimeError(f"Supabase {r.status_code}: {r.text[:300]}")
-        if not r.text.strip():
-            return []
-        return r.json()
-
+def supabase_client():
+    """便捷函数"""
+    return get_supabase_client()
 
 # ===== 用户操作 =====
 
-async def upsert_user(taptap_openid: str, player_name: str,
-                      avatar_url: str = "", is_global: bool = False) -> dict:
-    """创建或更新用户，返回 {id, session_token}"""
-    # 先查是否已存在
-    existing = await get_user_by_openid(taptap_openid)
-    if existing:
-        # 更新名字/头像
-        await _request("PATCH", "users",
-            params={"taptap_openid": f"eq.{taptap_openid}"},
-            body={"player_name": player_name, "avatar_url": avatar_url,
-                  "is_global": is_global})
-        return existing
-
-    # 新建：生成 session_token (UUID)
-    session_token = str(uuid.uuid4())
-    body = {
+async def upsert_user(
+    taptap_openid: str,
+    player_name: str = "",
+    avatar_url: str = "",
+    session_token: str = "",
+    is_global: bool = False
+) -> Dict[str, Any]:
+    """
+    插入或更新用户（基于 taptap_openid）
+    返回用户记录
+    """
+    sb = get_supabase_client()
+    data = {
         "taptap_openid": taptap_openid,
         "player_name": player_name,
         "avatar_url": avatar_url,
-        "session_token": session_token,
+        "last_session_token": session_token,
         "is_global": is_global,
+        "updated_at": "NOW()"  # 会在触发器自动更新
     }
-    result = await _request("POST", "users", body=body)
-    return result[0] if isinstance(result, list) and result else {
-        "id": None, "session_token": session_token
-    }
+    # 使用 upsert（PostgreSQL 的 ON CONFLICT）
+    res = sb.table("users").upsert(data, on_conflict="taptap_openid").execute()
+    if res.data:
+        return res.data[0]
+    else:
+        raise Exception("Upsert user failed")
 
+async def get_user_by_taptap_openid(openid: str) -> Optional[Dict[str, Any]]:
+    sb = get_supabase_client()
+    res = sb.table("users").select("*").eq("taptap_openid", openid).limit(1).execute()
+    if res.data:
+        return res.data[0]
+    return None
 
-async def get_user_by_openid(taptap_openid: str) -> dict | None:
-    result = await _request("GET", "users",
-        params={"taptap_openid": f"eq.{taptap_openid}", "limit": "1"})
-    return result[0] if isinstance(result, list) and result else None
-
-
-async def get_user_by_token(session_token: str) -> dict | None:
-    result = await _request("GET", "users",
-        params={"session_token": f"eq.{session_token}", "limit": "1"})
-    return result[0] if isinstance(result, list) and result else None
-
+async def get_user_by_session_token(session_token: str) -> Optional[Dict[str, Any]]:
+    sb = get_supabase_client()
+    res = sb.table("users").select("*").eq("last_session_token", session_token).limit(1).execute()
+    if res.data:
+        return res.data[0]
+    return None
 
 # ===== 存档操作 =====
 
-async def save_archive(user_id: str, game_record: dict, summary: dict,
-                       game_user: dict, b30_data: list,
-                       save_rks: float, computed_rks: float,
-                       total_songs: int) -> str:
-    """保存存档解析结果，返回 archive id"""
-    body = {
+async def save_archive(
+    user_id: str,
+    save_rks: float,
+    computed_rks: float,
+    total_songs: int,
+    total_cleared: int,
+    total_fc: int,
+    total_phi: int,
+    b30_data: List[dict],
+    all_scores: List[dict]
+) -> str:
+    """
+    保存一份存档到 archives 表
+    返回 archive_id
+    """
+    sb = get_supabase_client()
+    data = {
         "user_id": user_id,
-        "game_record": json.dumps(game_record),
-        "summary": json.dumps(summary),
-        "game_user": json.dumps(game_user),
-        "b30_data": json.dumps(b30_data),
         "save_rks": save_rks,
         "computed_rks": computed_rks,
         "total_songs": total_songs,
+        "total_cleared": total_cleared,
+        "total_fc": total_fc,
+        "total_phi": total_phi,
+        "b30_data": json.dumps(b30_data),
+        "all_scores": json.dumps(all_scores)
     }
-    result = await _request("POST", "archives", body=body)
-    return result[0].get("id") if isinstance(result, list) and result else None
+    res = sb.table("archives").insert(data).execute()
+    if res.data:
+        return res.data[0]["id"]
+    else:
+        raise Exception("Save archive failed")
 
+async def get_latest_archive(user_id: str) -> Optional[Dict[str, Any]]:
+    """
+    获取用户最新的一条存档记录
+    """
+    sb = get_supabase_client()
+    res = sb.table("archives")\
+        .select("*")\
+        .eq("user_id", user_id)\
+        .order("created_at", desc=True)\
+        .limit(1)\
+        .execute()
+    if res.data:
+        return res.data[0]
+    return None
 
-async def get_latest_archive(user_id: str) -> dict | None:
-    """获取用户最新存档"""
-    result = await _request("GET", "archives",
-        params={"user_id": f"eq.{user_id}",
-                "order": "created_at.desc",
-                "limit": "1"})
-    return result[0] if isinstance(result, list) and result else None
+async def get_all_archives(user_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+    sb = get_supabase_client()
+    res = sb.table("archives")\
+        .select("*")\
+        .eq("user_id", user_id)\
+        .order("created_at", desc=True)\
+        .limit(limit)\
+        .execute()
+    return res.data
 
+# ===== B30 历史 =====
 
-async def get_all_archives(user_id: str, limit: int = 50) -> list:
-    """获取用户所有存档"""
-    result = await _request("GET", "archives",
-        params={"user_id": f"eq.{user_id}",
-                "order": "created_at.desc",
-                "limit": str(limit)})
-    return result if isinstance(result, list) else []
-
-
-# ===== B30 历史快照 =====
-
-async def save_history(user_id: str, save_rks: float, computed_rks: float, b30_data: list):
-    body = {
+async def save_b30_history(
+    user_id: str,
+    save_rks: float,
+    computed_rks: float,
+    b30_data: List[dict]
+) -> str:
+    sb = get_supabase_client()
+    data = {
         "user_id": user_id,
         "save_rks": save_rks,
         "computed_rks": computed_rks,
-        "b30_data": json.dumps(b30_data),
+        "b30_data": json.dumps(b30_data)
     }
-    await _request("POST", "b30_history", body=body)
+    res = sb.table("b30_history").insert(data).execute()
+    if res.data:
+        return res.data[0]["id"]
+    else:
+        raise Exception("Save b30 history failed")
 
-
-async def get_history(user_id: str, limit: int = 50) -> list:
-    result = await _request("GET", "b30_history",
-        params={"user_id": f"eq.{user_id}",
-                "order": "created_at.desc",
-                "limit": str(limit)})
-    return result if isinstance(result, list) else []
-
+async def get_b30_history_for_user(user_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+    sb = get_supabase_client()
+    res = sb.table("b30_history")\
+        .select("*")\
+        .eq("user_id", user_id)\
+        .order("created_at", desc=True)\
+        .limit(limit)\
+        .execute()
+    return res.data
 
 # ===== 排行榜 =====
 
-async def get_leaderboard(limit: int = 100) -> list:
-    if not _is_configured():
-        return []
-    result = await _request("GET", "leaderboard",
-        params={"order": "save_rks.desc", "limit": str(limit)})
-    return result if isinstance(result, list) else []
+async def get_leaderboard(limit: int = 100) -> List[Dict[str, Any]]:
+    sb = get_supabase_client()
+    res = sb.table("leaderboard")\
+        .select("*")\
+        .order("save_rks", desc=True)\
+        .limit(limit)\
+        .execute()
+    return res.data
