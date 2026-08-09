@@ -57,8 +57,16 @@ async def poll_login(device_code, device_id, is_global=False):
     if "access_token" in resp or resp.get("success") is True:
         token = resp.get("data", resp)
         return {"status": "success", "token": token}
-    err = resp.get("data", {}).get("error") if isinstance(resp.get("data"), dict) else resp.get("error")
-    if err == "authorization_waiting":
+
+    # 提取错误信息（兼容不同响应结构）
+    err = None
+    if isinstance(resp.get("data"), dict):
+        err = resp.get("data", {}).get("error")
+    if not err:
+        err = resp.get("error")
+
+    # 处理常见的等待/扫描状态
+    if err in ("authorization_waiting", "authorization_pending"):
         return {"status": "waiting"}
     if err == "authorization_scanned":
         return {"status": "scanned"}
