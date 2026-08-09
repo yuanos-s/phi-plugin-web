@@ -1,0 +1,19 @@
+[project]
+name = "phi-plugin-web"
+version = "1.0.0"
+description = "Phigros 查分网页版 — FastAPI + TapTap 扫码登录"
+license = "GPL-3.0"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi[standard]",
+    "httpx",
+    "pycryptodome",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.uvicorn]
+host = "0.0.0.0"
+port = 8000
