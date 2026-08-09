@@ -28,7 +28,7 @@ async function startLogin() {
     $('#login-btn').textContent = '重新获取';
     $('#login-btn').disabled = false;
     if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(pollLogin, 2000);
+    pollTimer = setInterval(pollLogin, 3000);  // 改为 3 秒避免限流
   } catch(e) {
     $('#login-status').textContent = '获取失败: ' + e;
     $('#login-btn').disabled = false;
@@ -54,6 +54,12 @@ async function pollLogin() {
         $('#dashboard').style.display = 'block';
         switchTab('b30');
       }, 500);
+    } else if (d.status === 'expired') {   // 新增处理二维码过期
+      clearInterval(pollTimer); pollTimer = null;
+      $('#login-status').textContent = '二维码已过期，请点击「重新获取」刷新';
+      $('#login-btn').disabled = false;
+      $('#qr-img').style.display = 'none';
+      $('#qr-ph').style.display = 'flex';
     } else if (d.status === 'error') {
       clearInterval(pollTimer); pollTimer = null;
       $('#login-status').textContent = '失败: ' + (d.message||'');
