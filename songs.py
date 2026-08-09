@@ -4,13 +4,18 @@
 import csv
 import json
 import os
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 
 LEVELS = ["EZ", "HD", "IN", "AT", "LEGACY"]
 DATA_DIR = Path(__file__).parent / "data"
-ILL_BASE = os.getenv("PHI_ILL_BASE", "https://raw.githubusercontent.com/Catrong/phi-plugin-ill/main/ill")
-ILL_PROXY = os.getenv("PHI_ILL_PROXY", "https://gh-proxy.com")
+
+# 曲绘源：优先用 Supabase Storage，回退到 GitHub proxy
+_SB_URL = os.getenv("SUPABASE_URL", "")
+_ILL_BUCKET_URL = f"{_SB_URL}/storage/v1/object/public/song_illustrations" if _SB_URL else ""
+_ILL_GITHUB = "https://raw.githubusercontent.com/Catrong/phi-plugin-ill/main/ill"
+_ILL_PROXY = os.getenv("PHI_ILL_PROXY", "https://gh-proxy.com")
 
 _song_info: dict = {}
 _chapters: dict = {}
@@ -83,10 +88,15 @@ def load_all():
 
 
 def get_ill_url(song_id: str) -> str:
-    """获取曲绘在线 URL (通过 GitHub 代理)"""
+    """获取曲绘 URL — Supabase Storage (非 ASCII 文件名转写为 ASCII-safe)"""
     name = song_id.replace(".0", "")
-    raw = f"{ILL_BASE}/{name}.png"
-    return f"{ILL_PROXY}/{raw}"
+    fname = f"{name}.png"
+    if _ILL_BUCKET_URL:
+        # 与上传时一致：非 ASCII 字符替换为 _
+        safe_fname = fname.encode('ascii', 'replace').decode().replace('?', '_')
+        return f"{_ILL_BUCKET_URL}/{safe_fname}"
+    # 回退：GitHub raw + proxy
+    return f"{_ILL_PROXY}/{_ILL_GITHUB}/{name}.png"
 
 
 def get_all_songs() -> list:
