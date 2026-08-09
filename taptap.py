@@ -1,10 +1,5 @@
 """
-TapTap OAuth2 Device Code 登录 (无 LeanCloud)
-
-迁移变更:
-  - 移除 get_session_token (LeanCloud 登录) — LeanCloud 已停服
-  - 只保留 TapTap OAuth: 扫码 → 获取 token → 获取 profile
-  - profile 中的 openid/name/avatar 交给 Supabase 处理
+TapTap OAuth2 Device Code 登录（仅保留扫码和轮询功能）
 """
 import os
 import time
@@ -13,36 +8,18 @@ import hashlib
 import base64
 import random
 import string
-import json
 import httpx
 
-# ===== 环境变量 =====
+# ===== 从环境变量读取 TapTap Client ID =====
 TAP_CLIENT_ID = os.getenv("TAP_CLIENT_ID", "rAK3FfdieFob2Nn8Am")
 
-CN_TAP_AUTH = "https://accounts.tapapis.cn"
-CN_TAP_API  = "https://open.tapapis.cn"
-GB_TAP_AUTH = "https://accounts.tapapis.com"
-GB_TAP_API  = "https://open.tapapis.com"
+# ===== LeanCloud 凭证（仅保留作为注释，已停用） =====
+# 以下常量不再用于网络请求，仅作历史参考
+# CN_CLIENT_ID = "rAK3FfdieFob2Nn8Am"
+# CN_APP_KEY = "Qr9AEqtuoSVS3zeD6iVbM4ZC0AtkJcQ89tywVyi0"
 
-_TAP_ERROR_MAP = {
-    "authorization_waiting": "waiting",
-    "authorization_pending": "waiting",
-    "slow_down": "waiting",
-    "authorization_scanned": "scanned",
-    "invalid_grant_code": "expired",
-    "invalid_grant": "expired",
-    "invalid_device_code": "expired",
-    "expired_token": "expired",
-    "device_code_expired": "expired",
-    "access_denied": "error",
-    "unauthorized": "error",
-}
-
-
-def _cfg(is_global):
-    if is_global:
-        return GB_TAP_AUTH, GB_TAP_API
-    return CN_TAP_AUTH, CN_TAP_API
+# ===== TapTap API 地址 =====
+TAP_AUTH_BASE = "https://accounts.tapapis.cn"
 
 
 def _rand_dev_id():
@@ -50,7 +27,10 @@ def _rand_dev_id():
 
 
 async def request_qrcode(is_global=False):
-    auth_base, _ = _cfg(is_global)
+    """
+    请求二维码（设备码）
+    注意：is_global 参数仅保留接口兼容性，实际固定使用国服
+    """
     cid = TAP_CLIENT_ID
     dev_id = _rand_dev_id()
     files = {
@@ -59,10 +39,10 @@ async def request_qrcode(is_global=False):
         "scope": (None, "public_profile"),
         "version": (None, "2.1"),
         "platform": (None, "unity"),
-        "info": (None, json.dumps({"device_id": dev_id})),
+        "info": (None, f'{{"device_id":"{dev_id}"}}'),
     }
     async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.post(f"{auth_base}/oauth2/v1/device/code", files=files)
+        r = await c.post(f"{TAP_AUTH_BASE}/oauth2/v1/device/code", files=files)
         r.raise_for_status()
         resp = r.json()
     resp["device_id"] = dev_id
@@ -70,7 +50,9 @@ async def request_qrcode(is_global=False):
 
 
 async def poll_login(device_code, device_id, is_global=False):
-    auth_base, _ = _cfg(is_global)
+    """
+    轮询登录状态
+    """
     cid = TAP_CLIENT_ID
     files = {
         "grant_type": (None, "device_token"),
@@ -79,54 +61,35 @@ async def poll_login(device_code, device_id, is_global=False):
         "code": (None, device_code),
         "version": (None, "1.0"),
         "platform": (None, "unity"),
-        "info": (None, json.dumps({"device_id": device_id})),
+        "info": (None, f'{{"device_id":"{device_id}"}}'),
     }
-    try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.post(f"{auth_base}/oauth2/v1/token", files=files)
-            if r.status_code >= 400:
-                try:
-                    resp = r.json()
-                except Exception:
-                    if r.status_code in (400, 410):
-                        return {"status": "expired"}
-                    return {"status": "error", "message": f"TapTap HTTP {r.status_code}"}
-            else:
-                resp = r.json()
-    except httpx.RequestError as e:
-        return {"status": "error", "message": f"网络错误: {e}"}
-    except Exception as e:
-        return {"status": "error", "message": f"轮询异常: {e}"}
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.post(f"{TAP_AUTH_BASE}/oauth2/v1/token", files=files)
+        resp = r.json()
 
     if "access_token" in resp or resp.get("success") is True:
         token = resp.get("data", resp)
-        if "kid" not in token or "mac_key" not in token:
-            return {"status": "error",
-                    "message": f"token 缺少必要字段: {list(token.keys())}"}
         return {"status": "success", "token": token}
 
     err = None
     if isinstance(resp.get("data"), dict):
-        err = resp["data"].get("error")
+        err = resp.get("data", {}).get("error")
     if not err:
         err = resp.get("error")
 
+    if err in ("authorization_waiting", "authorization_pending", "slow_down"):
+        return {"status": "waiting"}
+    if err == "authorization_scanned":
+        return {"status": "scanned"}
+    if err == "invalid_grant_code":
+        return {"status": "expired"}
     if err:
-        mapped = _TAP_ERROR_MAP.get(err)
-        if mapped == "waiting":
-            return {"status": "waiting"}
-        if mapped == "scanned":
-            return {"status": "scanned"}
-        if mapped == "expired":
-            return {"status": "expired"}
-        if mapped == "error":
-            return {"status": "error", "message": err}
-        return {"status": "error", "message": f"TapTap 未知错误: {err}"}
-
+        return {"status": "error", "message": err}
     return {"status": "waiting"}
 
 
 def _mac_auth(url, method, kid, mac_key):
+    """生成 MAC 认证头（用于 TapTap 用户信息接口）"""
     from urllib.parse import urlparse
     p = urlparse(url)
     ts = str(int(time.time())).zfill(10)
@@ -134,24 +97,29 @@ def _mac_auth(url, method, kid, mac_key):
     host = p.hostname
     uri = p.path + (f"?{p.query}" if p.query else "")
     port = str(p.port or (443 if p.scheme == "https" else 80))
-    base_str = f"{ts}\n{nonce}\n{method}\n{uri}\n{host}\n{port}\n\n"
-    mac = base64.b64encode(
-        hmac.new(mac_key.encode(), base_str.encode(), hashlib.sha1).digest()
-    ).decode()
+    base = f"{ts}\n{nonce}\n{method}\n{uri}\n{host}\n{port}\n\n"
+    mac = base64.b64encode(hmac.new(mac_key.encode(), base.encode(), hashlib.sha1).digest()).decode()
     return f'MAC id="{kid}", ts="{ts}", nonce="{nonce}", mac="{mac}"'
 
 
 async def get_profile(token, is_global=False):
-    """获取 TapTap 用户 profile (openid, name, avatar)"""
-    _, api_base = _cfg(is_global)
+    """
+    获取 TapTap 用户信息
+    """
+    api_base = "https://open.tapapis.cn"
     cid = TAP_CLIENT_ID
     url = f"{api_base}/account/profile/v1?client_id={cid}"
     auth = _mac_auth(url, "GET", token["kid"], token["mac_key"])
-    try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get(url, headers={"Authorization": auth})
-            if r.status_code >= 400:
-                raise RuntimeError(f"TapTap profile HTTP {r.status_code}: {r.text[:200]}")
-            return r.json()
-    except httpx.RequestError as e:
-        raise RuntimeError(f"TapTap profile 网络错误: {e}")
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(url, headers={"Authorization": auth})
+        r.raise_for_status()
+        return r.json()
+
+
+# ===== 以下函数因 LeanCloud 停服已废弃 =====
+async def get_session_token(profile, token, is_global=False):
+    """已废弃：LeanCloud 已停服，该函数不再可用"""
+    raise NotImplementedError(
+        "LeanCloud 已停服，无法通过 TapTap 换取 sessionToken。"
+        "请使用 Supabase 存储用户信息，或让用户手动输入 sessionToken。"
+    )
