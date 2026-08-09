@@ -1,22 +1,28 @@
 """
 Phigros 存档获取、AES 解密、二进制解析
+
+修复:
+  #8  LeanCloud 凭证改为从环境变量读取，与 taptap.py 一致
+  #11 decrypt_save 加 PKCS7 校验和空数据保护
+  #12 BinaryReader 加越界保护
 """
 import struct
 import base64
 import zipfile
 import io
 import json
+import os
 import httpx
 from Crypto.Cipher import AES
 
-# ===== 常量 =====
-CN_CLIENT_ID = "rAK3FfdieFob2Nn8Am"
-CN_APP_KEY = "Qr9AEqtuoSVS3zeD6iVbM4ZC0AtkJcQ89tywVyi0"
-CN_LC_BASE = "https://rak3ffdi.cloud.tds1.tapapis.cn/1.1"
+# BUG #8: 从环境变量读取，与 taptap.py 一致
+CN_CLIENT_ID = os.getenv("CN_LC_ID", "rAK3FfdieFob2Nn8Am")
+CN_APP_KEY   = os.getenv("CN_LC_KEY", "Qr9AEqtuoSVS3zeD6iVbM4ZC0AtkJcQ89tywVyi0")
+CN_LC_BASE   = "https://rak3ffdi.cloud.tds1.tapapis.cn/1.1"
 
-GB_CLIENT_ID = "kviehleldgxsagpozb"
-GB_APP_KEY = "tG9CTm0LDD736k9HMM9lBZrbeBGRmUkjSfNLDNib"
-GB_LC_BASE = "https://kviehlel.cloud.ap-sg.tapapis.com/1.1"
+GB_CLIENT_ID = os.getenv("GB_LC_ID", "kviehleldgxsagpozb")
+GB_APP_KEY   = os.getenv("GB_LC_KEY", "tG9CTm0LDD736k9HMM9lBZrbeBGRmUkjSfNLDNib")
+GB_LC_BASE   = "https://kviehlel.cloud.ap-sg.tapapis.com/1.1"
 
 AES_KEY = base64.b64decode("6Jaa0qVAJZuXkZCLiOa/Ax5tIZVu+taKUN1V1nqwkks=")
 AES_IV = base64.b64decode("Kk/wisgNYwcAV8WVGMgyUw==")
@@ -30,7 +36,7 @@ def _cfg(is_global):
     return CN_CLIENT_ID, CN_APP_KEY, CN_LC_BASE
 
 
-# ===== Binary Reader =====
+# ===== Binary Reader (BUG #12: 加越界保护) =====
 class BinaryReader:
     def __init__(self, data: bytes):
         self.data = data
@@ -39,23 +45,33 @@ class BinaryReader:
     def remaining(self):
         return len(self.data) - self.pos
 
+    def _need(self, n):
+        if self.pos + n > len(self.data):
+            raise IndexError(f"读取越界: pos={self.pos} need={n} len={len(self.data)}")
+
     def get_byte(self):
+        self._need(1)
         b = self.data[self.pos]; self.pos += 1; return b
 
     def get_short(self):
+        self._need(2)
         self.pos += 2
         return self.data[self.pos-2] | (self.data[self.pos-1] << 8)
 
     def get_int(self):
+        self._need(4)
         self.pos += 4
         return struct.unpack_from("<i", self.data, self.pos-4)[0]
 
     def get_float(self):
+        self._need(4)
         self.pos += 4
         return struct.unpack_from("<f", self.data, self.pos-4)[0]
 
     def get_varint(self):
+        self._need(1)
         if self.data[self.pos] > 127:
+            self._need(2)
             self.pos += 2
             return (0x7F & self.data[self.pos-2]) | (self.data[self.pos-1] << 7)
         self.pos += 1
@@ -63,16 +79,27 @@ class BinaryReader:
 
     def get_string(self):
         length = self.get_varint()
+        self._need(length)
         self.pos += length
-        return self.data[self.pos-length:self.pos].decode("utf-8")
+        return self.data[self.pos-length:self.pos].decode("utf-8", errors="replace")
 
 
+# BUG #11: 加 PKCS7 校验和空数据保护
 def decrypt_save(ciphertext: bytes) -> bytes:
+    if not ciphertext or len(ciphertext) == 0:
+        raise ValueError("空密文")
+    if len(ciphertext) % 16 != 0:
+        raise ValueError(f"密文长度非 16 倍数: {len(ciphertext)}")
     cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_IV)
     plain = cipher.decrypt(ciphertext)
+    # PKCS7 校验
+    if len(plain) == 0:
+        return plain
     pad = plain[-1]
-    if 0 < pad <= 16:
-        plain = plain[:-pad]
+    if 1 <= pad <= 16:
+        # 校验最后 pad 个字节都等于 pad
+        if all(b == pad for b in plain[-pad:]):
+            plain = plain[:-pad]
     return plain
 
 
@@ -97,20 +124,23 @@ def parse_game_record(data: bytes) -> dict:
     count = r.get_varint()
     records = {}
     while r.remaining() > 0:
-        sid = r.get_string()
-        r.get_varint()  # skip
-        lvl_mask = r.get_byte()
-        fc_mask = r.get_byte()
-        levels = []
-        for lv in range(5):
-            if lvl_mask & (1 << lv):
-                score = r.get_int()
-                acc = r.get_float()
-                fc = (score == 1000000 and acc == 100) or bool(fc_mask & (1 << lv))
-                levels.append({"score": score, "acc": round(acc, 4), "fc": fc})
-            else:
-                levels.append(None)
-        records[sid] = levels
+        try:
+            sid = r.get_string()
+            r.get_varint()  # skip
+            lvl_mask = r.get_byte()
+            fc_mask = r.get_byte()
+            levels = []
+            for lv in range(5):
+                if lvl_mask & (1 << lv):
+                    score = r.get_int()
+                    acc = r.get_float()
+                    fc = (score == 1000000 and acc == 100) or bool(fc_mask & (1 << lv))
+                    levels.append({"score": score, "acc": round(acc, 4), "fc": fc})
+                else:
+                    levels.append(None)
+            records[sid] = levels
+        except IndexError:
+            break  # 数据截断，停止解析
     return {"song_count": count, "records": records}
 
 
@@ -159,7 +189,6 @@ async def fetch_zip(url: str) -> bytes:
         return r.content
 
 
-# ===== 完整存档 =====
 async def get_full_save(session_token, is_global=False):
     player = await lc_get_player_info(session_token, is_global)
     saves = await lc_get_saves(session_token, player["objectId"], is_global)

@@ -137,6 +137,24 @@ async function pollLogin() {
   if (!loginSessionId) return;
   try {
     const r = await fetch('/api/login/check?session_id=' + loginSessionId);
+    // BUG #10: 404/500 时停止轮询，不再被 catch 吞掉
+    if (r.status === 404) {
+      clearInterval(pollTimer); pollTimer = null;
+      clearInterval(countdownTimer); countdownTimer = null;
+      $('#login-status').textContent = '登录会话已过期，请重新获取二维码';
+      $('#login-status').classList.add('error');
+      $('#login-btn').disabled = false;
+      loginSessionId = null;
+      $('#qr-img').style.display = 'none';
+      $('#qr-ph').style.display = 'flex';
+      return;
+    }
+    if (r.status >= 500) {
+      // 服务器错误，不停止轮询，但提示
+      $('#login-status').textContent = '⚠️ 服务器暂时不可用，正在重试...';
+      $('#login-status').classList.add('error');
+      return;
+    }
     const d = await r.json();
 
     if (d.status === 'waiting') {
@@ -150,7 +168,6 @@ async function pollLogin() {
       isGlobal = d.is_global;
       cachedUserId = d.user_id || null;
       cachedPlayerName = d.player_name || '';
-      // 持久化到 localStorage
       localStorage.setItem('session_token', sessionToken);
       localStorage.setItem('is_global', isGlobal);
       if (cachedUserId) localStorage.setItem('user_id', cachedUserId);
@@ -172,7 +189,9 @@ async function pollLogin() {
       $('#login-status').textContent = '⚠️ ' + (d.message || '错误');
       $('#login-status').classList.add('error');
     }
-  } catch(e) {}
+  } catch(e) {
+    // 网络错误，不停止轮询，继续重试
+  }
 }
 
 function logout() {

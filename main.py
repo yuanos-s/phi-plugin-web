@@ -2,14 +2,13 @@
 Phi-Plugin Web — FastAPI 后端
 基于 Catrong/phi-plugin 移植 + Supabase 持久化
 
-新增 Supabase 集成:
-  - 登录成功后自动持久化 sessionToken 到 Supabase
-  - 前端可通过缓存的 sessionToken 自动登录（免重新扫码）
-  - B30 历快照存入 Supabase 数据库
-  - 排行榜 API
-  - 未配置 Supabase 时自动回退到本地存储
+修复:
+  #1  del _login_sessions → _login_sessions.pop(sid, None)，防止 KeyError
+  #9  _login_sessions 加 TTL 机制，5 分钟自动清理
+  #10 前端轮询 404/500 处理（在前端修复）
 """
 import uuid
+import time
 import logging
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -36,6 +35,17 @@ logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Phi-Plugin Web")
 _login_sessions: dict = {}
+_SESSION_TTL = 300  # 5 分钟
+
+
+def _cleanup_sessions():
+    """清理过期的登录会话"""
+    now = time.time()
+    expired = [k for k, v in _login_sessions.items()
+               if now - v.get("_ts", 0) > _SESSION_TTL]
+    for k in expired:
+        _login_sessions.pop(k, None)
+
 
 # ===== 页面 =====
 @app.get("/")
@@ -46,6 +56,7 @@ async def index():
 # ===== 登录 =====
 @app.post("/api/login/qrcode")
 async def api_qrcode(is_global: bool = False):
+    _cleanup_sessions()
     try:
         resp = await request_qrcode(is_global)
     except httpx.HTTPStatusError as e:
@@ -59,6 +70,7 @@ async def api_qrcode(is_global: bool = False):
         "device_code": data.get("device_code", resp.get("device_code", "")),
         "device_id": resp.get("device_id", ""),
         "is_global": is_global,
+        "_ts": time.time(),
     }
     return {"session_id": sid, "qr_url": data.get("qrcode_url", ""),
             "expires_in": data.get("expires_in", 300)}
@@ -66,16 +78,13 @@ async def api_qrcode(is_global: bool = False):
 
 @app.get("/api/login/check")
 async def api_check(session_id: str):
+    _cleanup_sessions()
     sess = _login_sessions.get(session_id)
     if not sess:
         raise HTTPException(404, "登录会话不存在或已过期，请重新获取二维码")
 
     try:
         result = await poll_login(sess["device_code"], sess["device_id"], sess["is_global"])
-    except httpx.HTTPStatusError as e:
-        return {"status": "error", "message": f"TapTap HTTP {e.response.status_code}"}
-    except httpx.RequestError:
-        return {"status": "waiting", "message": "网络超时，正在重试..."}
     except Exception as e:
         logger.exception("poll_login error")
         return {"status": "error", "message": f"轮询异常: {e}"}
@@ -85,40 +94,45 @@ async def api_check(session_id: str):
     if result["status"] == "scanned":
         return {"status": "scanned"}
     if result["status"] == "expired":
-        del _login_sessions[session_id]
+        # BUG #1: pop 代替 del
+        _login_sessions.pop(session_id, None)
         return {"status": "expired", "message": "二维码已过期"}
     if result["status"] == "error":
+        # 不删 session，让前端可以重试
         return {"status": "error", "message": result.get("message", "")}
 
     # 成功 → 获取 profile + sessionToken
     if result["status"] == "success":
         token = result["token"]
-        # 3a: TapTap profile
         try:
             profile = await get_profile(token, sess["is_global"])
+        except RuntimeError as e:
+            return {"status": "error", "message": str(e)}
         except Exception as e:
             logger.exception("get_profile failed")
             return {"status": "error", "message": f"获取 TapTap 用户信息失败: {e}"}
 
-        # 3b: LeanCloud sessionToken
         try:
             lc_resp = await get_session_token(profile, token, sess["is_global"])
         except RuntimeError as e:
-            return {"status": "error", "message": f"LeanCloud 登录失败: {e}"}
+            return {"status": "error", "message": str(e)}
         except Exception as e:
             logger.exception("get_session_token failed")
             return {"status": "error", "message": f"获取 sessionToken 异常: {e}"}
 
         st = lc_resp.get("sessionToken", "")
         if not st:
-            return {"status": "error", "message": f"LeanCloud 未返回 sessionToken: {lc_resp}"}
+            return {"status": "error",
+                    "message": f"LeanCloud 未返回 sessionToken: {lc_resp}"}
 
-        del _login_sessions[session_id]
+        # BUG #1: pop 代替 del
+        _login_sessions.pop(session_id, None)
         profile_data = profile.get("data", profile) if isinstance(profile, dict) else {}
 
-        # 3c: 持久化到 Supabase（如果已配置）
+        # 持久化到 Supabase
         user_id = None
-        taptap_openid = profile_data.get("openid") or profile_data.get("id") or profile_data.get("uid") or ""
+        taptap_openid = (profile_data.get("openid") or profile_data.get("id")
+                         or profile_data.get("uid") or "")
         if SB_OK and taptap_openid:
             try:
                 user_rec = await supabase.upsert_user(
@@ -143,15 +157,10 @@ async def api_check(session_id: str):
     return {"status": "waiting"}
 
 
-# ===== 自动登录（检查已保存的 sessionToken）=====
+# ===== 自动登录 =====
 @app.get("/api/auth/restore")
 async def api_restore(session_token: str):
-    """
-    前端用缓存的 sessionToken 尝试自动登录
-    如果 Supabase 已配置且 token 有效，返回用户信息
-    """
     if not SB_OK:
-        # 未配置 Supabase，直接返回 token 让前端用
         return {"status": "ok", "session_token": session_token,
                 "is_global": False, "player_name": ""}
 
@@ -160,7 +169,6 @@ async def api_restore(session_token: str):
         if not user:
             return {"status": "not_found", "message": "Token 未找到，请重新扫码"}
 
-        # 尝试验证 token 是否仍然有效
         from phigros import lc_get_player_info
         try:
             player = await lc_get_player_info(session_token, user.get("is_global", False))
@@ -173,7 +181,6 @@ async def api_restore(session_token: str):
                 "user_id": user.get("id"),
             }
         except httpx.HTTPStatusError:
-            # Token 已失效
             return {"status": "expired", "message": "Token 已失效，请重新扫码"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -183,7 +190,7 @@ async def api_restore(session_token: str):
 @app.get("/api/leaderboard")
 async def api_leaderboard(limit: int = 100):
     if not SB_OK:
-        return JSONResponse({"leaderboard": [], "note": "Supabase 未配置，排行榜不可用"})
+        return JSONResponse({"leaderboard": [], "note": "Supabase 未配置"})
     try:
         lb = await supabase.get_leaderboard(limit)
         return {"leaderboard": lb}
@@ -195,7 +202,6 @@ async def api_leaderboard(limit: int = 100):
 @app.get("/api/songs")
 async def api_songs():
     return get_all_songs()
-
 
 @app.get("/api/songs/{song_id}")
 async def api_song(song_id: str):
@@ -237,14 +243,6 @@ def _build_score_list(game_record: dict) -> list:
     return all_scores
 
 
-# 提取 user_id 的辅助函数
-def _get_user_id(session_token: str, is_global: bool = False) -> str | None:
-    if not SB_OK:
-        return None
-    # user_id 从前端传入或在 B30 流程中获取
-    return None
-
-
 @app.get("/api/user/b30")
 async def api_b30(session_token: str, is_global: bool = False,
                   user_id: str = Query(None)):
@@ -264,7 +262,6 @@ async def api_b30(session_token: str, is_global: bool = False,
     phi_rks = sum(s["rks"] for s in phi_scores)
     com_rks = (sum(s["rks"] for s in b30[:27]) + phi_rks) / 30 if b30 else 0
 
-    # 保存历史快照（优先 Supabase）
     try:
         await save_snapshot(
             session_token, player.get("nickname", ""), b30,
@@ -334,7 +331,6 @@ async def api_suggest(session_token: str, is_global: bool = False):
 
 @app.get("/api/user/history")
 async def api_history(session_token: str, user_id: str = Query(None)):
-    # 优先 Supabase
     if SB_OK and user_id:
         try:
             history = await get_history_async(session_token, user_id)
@@ -346,24 +342,15 @@ async def api_history(session_token: str, user_id: str = Query(None)):
         except Exception as e:
             logger.warning(f"Supabase history failed: {e}")
 
-    # 回退本地
     trend = get_rks_trend(session_token)
     return {"trend": trend, "count": len(trend)}
 
 
-# ===== 配置信息 =====
 @app.get("/api/config")
 async def api_config():
-    """返回前端需要的配置信息"""
-    return {
-        "supabase_enabled": SB_OK,
-        "leaderboard_available": SB_OK,
-    }
+    return {"supabase_enabled": SB_OK, "leaderboard_available": SB_OK}
 
-
-# 静态文件
 app.mount("/static", StaticFiles(directory="static"), name="static")
-
 
 if __name__ == "__main__":
     import uvicorn
