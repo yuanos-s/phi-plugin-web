@@ -35,9 +35,6 @@ def _rand_dev_id():
 
 
 async def request_qrcode(is_global=False):
-    """
-    请求二维码（设备码）
-    """
     cid, _, auth_base, _, _ = _cfg(is_global)
     dev_id = _rand_dev_id()
     files = {
@@ -57,9 +54,6 @@ async def request_qrcode(is_global=False):
 
 
 async def poll_login(device_code, device_id, is_global=False):
-    """
-    轮询登录状态
-    """
     cid, _, auth_base, _, _ = _cfg(is_global)
     files = {
         "grant_type": (None, "device_token"),
@@ -84,18 +78,18 @@ async def poll_login(device_code, device_id, is_global=False):
     if not err:
         err = resp.get("error")
 
-    # 处理各种等待/限流状态
     if err in ("authorization_waiting", "authorization_pending", "slow_down"):
         return {"status": "waiting"}
     if err == "authorization_scanned":
         return {"status": "scanned"}
+    if err == "invalid_grant_code":
+        return {"status": "expired"}  # 二维码过期
     if err:
         return {"status": "error", "message": err}
     return {"status": "waiting"}
 
 
 def _mac_auth(url, method, kid, mac_key):
-    """生成 MAC 认证头"""
     from urllib.parse import urlparse
     p = urlparse(url)
     ts = str(int(time.time())).zfill(10)
@@ -109,9 +103,6 @@ def _mac_auth(url, method, kid, mac_key):
 
 
 async def get_profile(token, is_global=False):
-    """
-    获取 TapTap 用户信息
-    """
     cid, _, _, api_base, _ = _cfg(is_global)
     url = f"{api_base}/account/profile/v1?client_id={cid}"
     auth = _mac_auth(url, "GET", token["kid"], token["mac_key"])
@@ -121,9 +112,6 @@ async def get_profile(token, is_global=False):
 
 
 async def get_session_token(profile, token, is_global=False):
-    """
-    用 TapTap 用户信息在 LeanCloud 创建/登录用户，返回 sessionToken
-    """
     cid, app_key, _, _, lc_base = _cfg(is_global)
     ts = str(int(time.time()))
     sign = hashlib.md5(f"{ts}{app_key}".encode()).hexdigest()
@@ -132,11 +120,9 @@ async def get_session_token(profile, token, is_global=False):
         "Content-Type": "application/json",
         "X-LC-Sign": f"{sign},{ts}",
     }
-    # 从 profile 中提取 openid（TapTap 用户唯一标识）
     openid = profile.get("openid") or profile.get("id") or profile.get("uid")
     if not openid:
         raise ValueError("无法从 TapTap profile 中获取 openid")
-    # 构造符合 LeanCloud 要求的 authData
     auth_data = {
         "openid": openid,
         "access_token": token.get("access_token"),
@@ -146,7 +132,6 @@ async def get_session_token(profile, token, is_global=False):
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.post(f"{lc_base}/users", json=body, headers=headers)
         resp = r.json()
-    # 检查 LeanCloud 是否返回错误
     if "error" in resp or "code" in resp:
         raise RuntimeError(f"LeanCloud 返回错误: {resp}")
     return resp
