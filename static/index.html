@@ -8,12 +8,12 @@
 </head>
 <body>
 
-<!-- 主题切换 -->
 <div class="theme-toggle" onclick="toggleTheme()" title="切换主题">🌙</div>
 
 <!-- 登录页 -->
 <div id="login-page" class="login-wrap">
-  <div class="login-card">
+  <div id="login-checking" style="color:var(--muted);font-size:13px;display:none">正在检查登录状态...</div>
+  <div class="login-card" id="login-card-main">
     <h1>🎵 Phi-Plugin Web</h1>
     <p class="sub">Phigros 查分 — TapTap 扫码登录</p>
     <div class="server-toggle">
@@ -60,12 +60,14 @@
       <button class="tab" data-tab="songs" onclick="switchTab('songs')">全部成绩</button>
       <button class="tab" data-tab="suggest" onclick="switchTab('suggest')">推分建议</button>
       <button class="tab" data-tab="history" onclick="switchTab('history')">历史成绩</button>
+      <button class="tab" data-tab="leaderboard" onclick="switchTab('leaderboard')">排行榜</button>
     </div>
 
     <div class="tab-content active" data-tab="b30" id="b30-content"></div>
     <div class="tab-content" data-tab="songs" id="songs-content"></div>
     <div class="tab-content" data-tab="suggest" id="suggest-content"></div>
     <div class="tab-content" data-tab="history" id="history-content"></div>
+    <div class="tab-content" data-tab="leaderboard" id="leaderboard-content"></div>
   </div>
 </div>
 

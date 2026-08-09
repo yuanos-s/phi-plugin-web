@@ -1,11 +1,13 @@
 """
 Phi-Plugin Web — FastAPI 后端
-基于 Catrong/phi-plugin 移植
+基于 Catrong/phi-plugin 移植 + Supabase 持久化
 
-修复：
-1. /api/login/check 500 错误：所有异常捕获并返回明确信息
-2. session 不在错误时删除（只在成功/过期时删除）
-3. 详细错误信息返回前端
+新增 Supabase 集成:
+  - 登录成功后自动持久化 sessionToken 到 Supabase
+  - 前端可通过缓存的 sessionToken 自动登录（免重新扫码）
+  - B30 历快照存入 Supabase 数据库
+  - 排行榜 API
+  - 未配置 Supabase 时自动回退到本地存储
 """
 import uuid
 import logging
@@ -20,15 +22,20 @@ from phigros import get_full_save, parse_summary, parse_game_record, parse_game_
 from songs import (load_all, get_all_songs, get_song, get_difficulty, get_song_name,
                    get_ill_url, calc_rks, rating, compute_suggest, min_up_rks,
                    suggest_acc, LEVELS)
-from history import save_snapshot, get_history, get_rks_trend
+from history import save_snapshot, get_history_async, get_rks_trend
+
+# Supabase 客户端（可选）
+try:
+    import db as supabase
+    SB_OK = supabase._is_configured()
+except Exception:
+    SB_OK = False
 
 logger = logging.getLogger("phi-web")
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Phi-Plugin Web")
-
 _login_sessions: dict = {}
-
 
 # ===== 页面 =====
 @app.get("/")
@@ -42,7 +49,7 @@ async def api_qrcode(is_global: bool = False):
     try:
         resp = await request_qrcode(is_global)
     except httpx.HTTPStatusError as e:
-        raise HTTPException(502, f"TapTap API 错误: {e.response.status_code} {e.response.text[:200]}")
+        raise HTTPException(502, f"TapTap API 错误: {e.response.status_code}")
     except Exception as e:
         logger.exception("request_qrcode failed")
         raise HTTPException(500, f"获取二维码失败: {e}")
@@ -52,7 +59,6 @@ async def api_qrcode(is_global: bool = False):
         "device_code": data.get("device_code", resp.get("device_code", "")),
         "device_id": resp.get("device_id", ""),
         "is_global": is_global,
-        "created_at": __import__("time").time(),
     }
     return {"session_id": sid, "qr_url": data.get("qrcode_url", ""),
             "expires_in": data.get("expires_in", 300)}
@@ -64,80 +70,125 @@ async def api_check(session_id: str):
     if not sess:
         raise HTTPException(404, "登录会话不存在或已过期，请重新获取二维码")
 
-    # Step 1: 轮询 TapTap 登录状态
     try:
         result = await poll_login(sess["device_code"], sess["device_id"], sess["is_global"])
     except httpx.HTTPStatusError as e:
-        # TapTap 返回了 HTTP 错误（非 200）
-        return {"status": "error",
-                "message": f"TapTap 返回 HTTP {e.response.status_code}"}
-    except httpx.RequestError as e:
-        # 网络超时等，不删 session，让前端继续重试
+        return {"status": "error", "message": f"TapTap HTTP {e.response.status_code}"}
+    except httpx.RequestError:
         return {"status": "waiting", "message": "网络超时，正在重试..."}
     except Exception as e:
-        logger.exception("poll_login unexpected error")
+        logger.exception("poll_login error")
         return {"status": "error", "message": f"轮询异常: {e}"}
 
-    # Step 2: 根据状态处理
     if result["status"] == "waiting":
         return {"status": "waiting"}
     if result["status"] == "scanned":
         return {"status": "scanned"}
     if result["status"] == "expired":
         del _login_sessions[session_id]
-        return {"status": "expired", "message": "二维码已过期，请重新获取"}
+        return {"status": "expired", "message": "二维码已过期"}
     if result["status"] == "error":
-        # 不删 session，给用户重试机会
-        return {"status": "error", "message": result.get("message", "未知错误")}
+        return {"status": "error", "message": result.get("message", "")}
 
-    # Step 3: 登录成功，获取 profile + sessionToken
-    # 关键修复：错误时 NOT 删除 session，返回明确错误让前端可以重试
+    # 成功 → 获取 profile + sessionToken
     if result["status"] == "success":
         token = result["token"]
-        errors = []
-
-        # 3a: 获取 TapTap profile
-        profile = None
+        # 3a: TapTap profile
         try:
             profile = await get_profile(token, sess["is_global"])
-        except httpx.RequestError as e:
-            return {"status": "error",
-                    "message": f"获取 TapTap 用户信息失败（网络错误）: {e}"}
         except Exception as e:
             logger.exception("get_profile failed")
-            return {"status": "error",
-                    "message": f"获取 TapTap 用户信息失败: {e}"}
+            return {"status": "error", "message": f"获取 TapTap 用户信息失败: {e}"}
 
-        # 3b: 用 profile + token 登录 LeanCloud 获取 sessionToken
+        # 3b: LeanCloud sessionToken
         try:
             lc_resp = await get_session_token(profile, token, sess["is_global"])
         except RuntimeError as e:
-            return {"status": "error",
-                    "message": f"LeanCloud 登录失败: {e}"}
-        except httpx.RequestError as e:
-            return {"status": "error",
-                    "message": f"LeanCloud 网络错误: {e}"}
+            return {"status": "error", "message": f"LeanCloud 登录失败: {e}"}
         except Exception as e:
             logger.exception("get_session_token failed")
-            return {"status": "error",
-                    "message": f"获取 sessionToken 异常: {e}"}
+            return {"status": "error", "message": f"获取 sessionToken 异常: {e}"}
 
-        # 3c: 成功！
         st = lc_resp.get("sessionToken", "")
         if not st:
-            return {"status": "error",
-                    "message": f"LeanCloud 未返回 sessionToken: {lc_resp}"}
+            return {"status": "error", "message": f"LeanCloud 未返回 sessionToken: {lc_resp}"}
 
         del _login_sessions[session_id]
         profile_data = profile.get("data", profile) if isinstance(profile, dict) else {}
+
+        # 3c: 持久化到 Supabase（如果已配置）
+        user_id = None
+        taptap_openid = profile_data.get("openid") or profile_data.get("id") or profile_data.get("uid") or ""
+        if SB_OK and taptap_openid:
+            try:
+                user_rec = await supabase.upsert_user(
+                    taptap_openid=taptap_openid,
+                    player_name=profile_data.get("name", ""),
+                    session_token=st,
+                    is_global=sess["is_global"],
+                )
+                user_id = user_rec.get("id")
+            except Exception as e:
+                logger.warning(f"Supabase upsert failed (非致命): {e}")
+
         return {
             "status": "success",
             "session_token": st,
             "is_global": sess["is_global"],
             "player_name": profile_data.get("name", ""),
+            "taptap_openid": taptap_openid,
+            "user_id": user_id,
         }
 
     return {"status": "waiting"}
+
+
+# ===== 自动登录（检查已保存的 sessionToken）=====
+@app.get("/api/auth/restore")
+async def api_restore(session_token: str):
+    """
+    前端用缓存的 sessionToken 尝试自动登录
+    如果 Supabase 已配置且 token 有效，返回用户信息
+    """
+    if not SB_OK:
+        # 未配置 Supabase，直接返回 token 让前端用
+        return {"status": "ok", "session_token": session_token,
+                "is_global": False, "player_name": ""}
+
+    try:
+        user = await supabase.get_user_by_token(session_token)
+        if not user:
+            return {"status": "not_found", "message": "Token 未找到，请重新扫码"}
+
+        # 尝试验证 token 是否仍然有效
+        from phigros import lc_get_player_info
+        try:
+            player = await lc_get_player_info(session_token, user.get("is_global", False))
+            return {
+                "status": "ok",
+                "session_token": session_token,
+                "is_global": user.get("is_global", False),
+                "player_name": player.get("nickname", user.get("player_name", "")),
+                "taptap_openid": user.get("taptap_openid", ""),
+                "user_id": user.get("id"),
+            }
+        except httpx.HTTPStatusError:
+            # Token 已失效
+            return {"status": "expired", "message": "Token 已失效，请重新扫码"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ===== 排行榜 =====
+@app.get("/api/leaderboard")
+async def api_leaderboard(limit: int = 100):
+    if not SB_OK:
+        return JSONResponse({"leaderboard": [], "note": "Supabase 未配置，排行榜不可用"})
+    try:
+        lb = await supabase.get_leaderboard(limit)
+        return {"leaderboard": lb}
+    except Exception as e:
+        return JSONResponse({"leaderboard": [], "error": str(e)})
 
 
 # ===== 曲目数据 =====
@@ -186,8 +237,17 @@ def _build_score_list(game_record: dict) -> list:
     return all_scores
 
 
+# 提取 user_id 的辅助函数
+def _get_user_id(session_token: str, is_global: bool = False) -> str | None:
+    if not SB_OK:
+        return None
+    # user_id 从前端传入或在 B30 流程中获取
+    return None
+
+
 @app.get("/api/user/b30")
-async def api_b30(session_token: str, is_global: bool = False):
+async def api_b30(session_token: str, is_global: bool = False,
+                  user_id: str = Query(None)):
     try:
         save = await get_full_save(session_token, is_global)
     except httpx.HTTPStatusError as e:
@@ -204,8 +264,15 @@ async def api_b30(session_token: str, is_global: bool = False):
     phi_rks = sum(s["rks"] for s in phi_scores)
     com_rks = (sum(s["rks"] for s in b30[:27]) + phi_rks) / 30 if b30 else 0
 
-    save_snapshot(session_token, player.get("nickname", ""), b30,
-                  summary.get("ranking_score", 0), round(com_rks, 4))
+    # 保存历史快照（优先 Supabase）
+    try:
+        await save_snapshot(
+            session_token, player.get("nickname", ""), b30,
+            summary.get("ranking_score", 0), round(com_rks, 4),
+            user_id=user_id,
+        )
+    except Exception as e:
+        logger.warning(f"保存历史失败 (非致命): {e}")
 
     total_cleared = sum(summary.get("cleared", [0]*4))
     total_fc = sum(summary.get("full_combo", [0]*4))
@@ -266,10 +333,32 @@ async def api_suggest(session_token: str, is_global: bool = False):
 
 
 @app.get("/api/user/history")
-async def api_history(session_token: str):
+async def api_history(session_token: str, user_id: str = Query(None)):
+    # 优先 Supabase
+    if SB_OK and user_id:
+        try:
+            history = await get_history_async(session_token, user_id)
+            if history:
+                trend = [{"ts": h.get("created_at",""), "save_rks": h.get("save_rks",0),
+                          "computed_rks": h.get("computed_rks",0)}
+                         for h in history]
+                return {"trend": trend, "count": len(history)}
+        except Exception as e:
+            logger.warning(f"Supabase history failed: {e}")
+
+    # 回退本地
     trend = get_rks_trend(session_token)
-    history = get_history(session_token)
-    return {"trend": trend, "count": len(history)}
+    return {"trend": trend, "count": len(trend)}
+
+
+# ===== 配置信息 =====
+@app.get("/api/config")
+async def api_config():
+    """返回前端需要的配置信息"""
+    return {
+        "supabase_enabled": SB_OK,
+        "leaderboard_available": SB_OK,
+    }
 
 
 # 静态文件

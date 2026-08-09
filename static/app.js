@@ -1,4 +1,4 @@
-// Phi-Plugin Web — 前端逻辑 (增强版)
+// Phi-Plugin Web — 前端逻辑 (Supabase 增强版)
 let selectedGlobal = false;
 let loginSessionId = null;
 let pollTimer = null;
@@ -6,8 +6,11 @@ let countdownTimer = null;
 let sessionToken = null;
 let isGlobal = false;
 let currentTab = 'b30';
+let cachedUserId = null;      // Supabase user_id
+let cachedPlayerName = '';
+let sbEnabled = false;
 
-// ===== 主题切换 =====
+// ===== 主题 =====
 function toggleTheme() {
   const cur = document.documentElement.getAttribute('data-theme');
   const next = cur === 'light' ? '' : 'light';
@@ -26,6 +29,55 @@ function toggleTheme() {
   }
 })();
 
+// ===== 页面加载时检查自动登录 =====
+(async function autoLogin() {
+  const savedToken = localStorage.getItem('session_token');
+  const savedUid = localStorage.getItem('user_id');
+
+  // 先获取配置
+  try {
+    const r = await fetch('/api/config');
+    const d = await r.json();
+    sbEnabled = d.supabase_enabled;
+  } catch(e) { sbEnabled = false; }
+
+  if (!savedToken) {
+    // 没有缓存 token，直接显示登录页
+    $('#login-card-main').style.display = 'block';
+    return;
+  }
+
+  // 检查缓存的 token 是否有效
+  $('#login-checking').style.display = 'block';
+  try {
+    const r = await fetch('/api/auth/restore?session_token=' + encodeURIComponent(savedToken));
+    const d = await r.json();
+    if (d.status === 'ok') {
+      // 自动登录成功
+      sessionToken = d.session_token;
+      isGlobal = d.is_global;
+      cachedUserId = d.user_id || savedUid || null;
+      cachedPlayerName = d.player_name || '';
+      $('#login-checking').style.display = 'none';
+      $('#login-page').style.display = 'none';
+      $('#dashboard').style.display = 'block';
+      switchTab('b30');
+    } else {
+      // Token 失效，清除缓存，显示登录页
+      localStorage.removeItem('session_token');
+      localStorage.removeItem('user_id');
+      $('#login-checking').style.display = 'none';
+      $('#login-card-main').style.display = 'block';
+      if (d.status === 'expired') {
+        $('#login-status').textContent = '登录已过期，请重新扫码';
+      }
+    }
+  } catch(e) {
+    $('#login-checking').style.display = 'none';
+    $('#login-card-main').style.display = 'block';
+  }
+})();
+
 // ===== Login =====
 function selectServer(g) {
   selectedGlobal = g;
@@ -40,7 +92,7 @@ async function startLogin() {
   try {
     const r = await fetch('/api/login/qrcode?is_global=' + selectedGlobal, {method:'POST'});
     const d = await r.json();
-    if (!r.ok) { throw new Error(d.detail || '请求失败'); }
+    if (!r.ok) throw new Error(d.detail || '请求失败');
     loginSessionId = d.session_id;
 
     $('#qr-img-el').src = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(d.qr_url);
@@ -49,8 +101,6 @@ async function startLogin() {
     $('#login-status').textContent = '请使用 TapTap App 扫描二维码';
     $('#login-btn').textContent = '重新获取';
     $('#login-btn').disabled = false;
-
-    // 倒计时
     startCountdown(d.expires_in || 300);
 
     if (pollTimer) clearInterval(pollTimer);
@@ -75,8 +125,7 @@ function startCountdown(seconds) {
       $('#qr-ph').style.display = 'flex';
       return;
     }
-    const m = Math.floor(remain / 60);
-    const s = remain % 60;
+    const m = Math.floor(remain / 60), s = remain % 60;
     $('#qr-countdown').textContent = `⏱ ${m}:${s.toString().padStart(2,'0')}`;
     remain--;
   };
@@ -99,6 +148,12 @@ async function pollLogin() {
       clearInterval(countdownTimer); countdownTimer = null;
       sessionToken = d.session_token;
       isGlobal = d.is_global;
+      cachedUserId = d.user_id || null;
+      cachedPlayerName = d.player_name || '';
+      // 持久化到 localStorage
+      localStorage.setItem('session_token', sessionToken);
+      localStorage.setItem('is_global', isGlobal);
+      if (cachedUserId) localStorage.setItem('user_id', cachedUserId);
       $('#login-status').textContent = '✅ 登录成功！正在跳转...';
       setTimeout(() => {
         $('#login-page').style.display = 'none';
@@ -114,21 +169,21 @@ async function pollLogin() {
       $('#qr-img').style.display = 'none';
       $('#qr-ph').style.display = 'flex';
     } else if (d.status === 'error') {
-      // 不停止轮询，给用户重试机会（服务端没删 session）
       $('#login-status').textContent = '⚠️ ' + (d.message || '错误');
       $('#login-status').classList.add('error');
     }
-  } catch(e) {
-    // 网络错误，继续重试
-  }
+  } catch(e) {}
 }
 
 function logout() {
-  sessionToken = null; isGlobal = false;
+  sessionToken = null; isGlobal = false; cachedUserId = null;
   if (pollTimer) clearInterval(pollTimer);
   if (countdownTimer) clearInterval(countdownTimer);
+  localStorage.removeItem('session_token');
+  localStorage.removeItem('user_id');
   $('#dashboard').style.display = 'none';
   $('#login-page').style.display = 'flex';
+  $('#login-card-main').style.display = 'block';
   $('#login-btn').disabled = false;
   $('#login-btn').textContent = '获取二维码';
   $('#login-status').textContent = '';
@@ -136,8 +191,7 @@ function logout() {
   $('#qr-countdown').textContent = '';
   $('#qr-img').style.display = 'none';
   $('#qr-ph').style.display = 'flex';
-  // 清除已加载的数据缓存
-  ['b30','songs','suggest','history'].forEach(t => {
+  ['b30','songs','suggest','history','leaderboard'].forEach(t => {
     const el = $(`#${t}-content`); if (el) { el.innerHTML = ''; el.dataset.loaded = ''; }
   });
 }
@@ -151,6 +205,7 @@ function switchTab(name) {
   else if (name === 'songs') loadAllScores();
   else if (name === 'suggest') loadSuggest();
   else if (name === 'history') loadHistory();
+  else if (name === 'leaderboard') loadLeaderboard();
 }
 
 // ===== 骨架屏 =====
@@ -158,10 +213,9 @@ function b30Skeleton(n=8) {
   let html = '<div class="b30-skeleton">';
   for (let i = 0; i < n; i++) {
     html += `<div class="skel-card">
-      <div class="skel-ill skeleton" style="height:0;aspect-ratio:16/9"></div>
+      <div class="skel-ill skeleton" style="aspect-ratio:16/9"></div>
       <div class="skel-body"><div class="skel-line skeleton" style="width:60%"></div>
-      <div class="skel-line skeleton" style="width:40%;height:10px"></div></div>
-    </div>`;
+      <div class="skel-line skeleton" style="width:40%;height:10px"></div></div></div>`;
   }
   return html + '</div>';
 }
@@ -186,11 +240,13 @@ async function loadB30() {
   const el = $('#b30-content');
   el.innerHTML = b30Skeleton();
   try {
-    const r = await fetch(`/api/user/b30?session_token=${encodeURIComponent(sessionToken)}&is_global=${isGlobal}`);
+    let url = `/api/user/b30?session_token=${encodeURIComponent(sessionToken)}&is_global=${isGlobal}`;
+    if (cachedUserId) url += `&user_id=${cachedUserId}`;
+    const r = await fetch(url);
     if (!r.ok) { const e = await r.json(); el.innerHTML = `<div class="error">${e.detail||r.statusText}</div>`; return; }
     const d = await r.json();
 
-    $('#p-name').textContent = d.player.nickname || '未知';
+    $('#p-name').textContent = d.player.nickname || cachedPlayerName || '未知';
     $('#p-id').textContent = d.player.player_id ? 'ID: ' + d.player.player_id : '';
     $('#s-rks').textContent = (d.save_rks||0).toFixed(2);
     $('#s-com-rks').textContent = (d.computed_rks||0).toFixed(2);
@@ -243,15 +299,12 @@ async function loadAllScores() {
     html += '<div class="table-wrap"><table class="tbl"><thead><tr><th>#</th><th>曲目</th><th>难度</th><th>定数</th><th>分数</th><th>ACC</th><th>RKS</th><th>评级</th></tr></thead><tbody id="songs-tbody">';
     scores.forEach((s, i) => {
       html += `<tr data-song="${esc(s.song.toLowerCase())}">
-        <td>${i+1}</td>
-        <td>${esc(s.song)}</td>
+        <td>${i+1}</td><td>${esc(s.song)}</td>
         <td><span class="diff diff-${s.level}">${s.level}</span></td>
-        <td>${s.difficulty.toFixed(1)}</td>
-        <td>${s.score.toLocaleString()}</td>
+        <td>${s.difficulty.toFixed(1)}</td><td>${s.score.toLocaleString()}</td>
         <td style="font-family:monospace">${s.acc.toFixed(2)}%</td>
         <td style="font-family:monospace;color:var(--accent);font-weight:600">${s.rks.toFixed(2)}</td>
-        <td><span class="rt rt-${s.rating}">${s.rating}</span></td>
-      </tr>`;
+        <td><span class="rt rt-${s.rating}">${s.rating}</span></td></tr>`;
     });
     html += '</tbody></table></div>';
     el.innerHTML = html;
@@ -308,7 +361,9 @@ async function loadHistory() {
   const el = $('#history-content');
   el.innerHTML = '<div class="loading">正在加载历史...</div>';
   try {
-    const r = await fetch(`/api/user/history?session_token=${encodeURIComponent(sessionToken)}`);
+    let url = `/api/user/history?session_token=${encodeURIComponent(sessionToken)}`;
+    if (cachedUserId) url += `&user_id=${cachedUserId}`;
+    const r = await fetch(url);
     const d = await r.json();
     const trend = d.trend || [];
     if (!trend.length) {
@@ -320,7 +375,7 @@ async function loadHistory() {
     html += '</div>';
     html += '<div class="history-list">';
     trend.slice().reverse().forEach(h => {
-      const dt = new Date(h.ts);
+      const dt = h.ts ? new Date(h.ts) : new Date();
       html += `<div class="history-item">
         <span style="color:var(--muted);font-size:12px">${dt.toLocaleString('zh-CN')}</span>
         <span style="font-family:monospace;font-weight:bold;color:var(--accent)">${(h.save_rks||0).toFixed(2)} / ${(h.computed_rks||0).toFixed(2)}</span>
@@ -354,6 +409,38 @@ function renderTrendChart(trend) {
       return `<circle cx="${x}" cy="${y}" r="3" fill="${accent}"/><text x="${x}" y="${y-8}" fill="${muted}" font-size="10" text-anchor="middle">${(t.save_rks||0).toFixed(2)}</text>`;
     }).join('')}
   </svg>`;
+}
+
+// ===== Leaderboard =====
+async function loadLeaderboard() {
+  const el = $('#leaderboard-content');
+  if (el.dataset.loaded === '1') return;
+  el.innerHTML = '<div class="loading">正在加载排行榜...</div>';
+  try {
+    const r = await fetch('/api/leaderboard?limit=100');
+    const d = await r.json();
+    const lb = d.leaderboard || [];
+    if (!lb.length) {
+      el.innerHTML = '<div class="note">排行榜暂无数据（需要配置 Supabase 并有用户查看过 B30）</div>';
+      return;
+    }
+    let html = '<div class="table-wrap"><table class="tbl"><thead><tr><th>#</th><th>玩家</th><th>RKS (存档)</th><th>RKS (计算)</th><th>更新时间</th></tr></thead><tbody>';
+    lb.forEach((u, i) => {
+      const dt = u.created_at ? new Date(u.created_at) : null;
+      const dtStr = dt ? dt.toLocaleDateString('zh-CN') : '--';
+      const isMe = (cachedUserId && u.user_id === cachedUserId);
+      html += `<tr${isMe ? ' style="background:rgba(110,168,254,.1)"' : ''}>
+        <td style="font-weight:bold;color:var(--accent)">${i+1}</td>
+        <td>${esc(u.player_name || '匿名')} ${isMe ? '←' : ''}</td>
+        <td style="font-family:monospace">${(u.save_rks||0).toFixed(2)}</td>
+        <td style="font-family:monospace;color:var(--green)">${(u.computed_rks||0).toFixed(2)}</td>
+        <td style="color:var(--muted);font-size:12px">${dtStr}</td>
+      </tr>`;
+    });
+    html += '</tbody></table></div>';
+    el.innerHTML = html;
+    el.dataset.loaded = '1';
+  } catch(e) { el.innerHTML = `<div class="error">${e}</div>`; }
 }
 
 // ===== Utils =====
